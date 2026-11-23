@@ -34,9 +34,27 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
+variable "aws_availability_zones" {
+  description = "AWS Availability Zones for runner subnets in aws_region."
+  type        = list(string)
+  default     = ["us-east-1a", "us-east-1b"]
+}
+
 variable "domain" {
   description = "Public HTTPS domain for the open-ci control plane."
   type        = string
+}
+
+variable "create_spot_service_linked_role" {
+  description = "Create the account-wide EC2 Spot service-linked role. Set false if the account already has AWSServiceRoleForEC2Spot."
+  type        = bool
+  default     = true
+}
+
+variable "janitor_max_lifetime_seconds" {
+  description = "Janitor runner lifetime ceiling from launch; must be at least the largest pools.*.lifetime_seconds."
+  type        = number
+  default     = 3600
 }
 
 variable "janitor_zip_path" {
@@ -72,9 +90,16 @@ module "gcp_controller" {
 }
 
 module "aws_foundation" {
-  source           = "../../modules/aws-foundation"
-  aws_region       = var.aws_region
-  janitor_zip_path = var.janitor_zip_path
+  source             = "../../modules/aws-foundation"
+  aws_region         = var.aws_region
+  availability_zones = var.aws_availability_zones
+  janitor_zip_path   = var.janitor_zip_path
+
+  janitor_max_lifetime_seconds = var.janitor_max_lifetime_seconds
+
+  create_spot_service_linked_role          = var.create_spot_service_linked_role
+  federate_gcp_controller                  = true
+  gcp_controller_service_account_unique_id = module.gcp_controller.controller_service_account_unique_id
 }
 
 output "controller_ip" {
@@ -95,4 +120,14 @@ output "aws_security_group" {
 
 output "aws_controller_policy_arn" {
   value = module.aws_foundation.controller_policy_arn
+}
+
+output "aws_role_arn" {
+  description = "Set as aws.role_arn in open-ci.toml; the GCP controller assumes it keylessly."
+  value       = module.aws_foundation.gcp_controller_role_arn
+}
+
+output "aws_web_identity_audience" {
+  description = "Set as aws.web_identity_audience in open-ci.toml."
+  value       = module.aws_foundation.web_identity_audience
 }

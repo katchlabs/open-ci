@@ -32,3 +32,8 @@ output "public_url" {
   description = "Base HTTPS URL for the open-ci control plane."
   value       = "https://${var.domain}"
 }
+
+output "ssm_session_command" {
+  description = "Command that opens an operator shell on the controller through SSM Session Manager."
+  value       = var.enable_ssm ? "aws ssm start-session --region ${data.aws_region.current.name} --target ${aws_instance.controller.id}" : ""
+}

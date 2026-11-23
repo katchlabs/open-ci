@@ -37,9 +37,15 @@ variable "instance_type" {
 }
 
 variable "ami_id" {
-  description = "Optional custom AMI ID for the controller host. When empty, uses the latest official Debian 12 AMI for var.architecture."
+  description = "Optional custom AMI ID for the controller host. When empty, uses the latest official Ubuntu 24.04 AMI for var.architecture (SSM agent preinstalled)."
   type        = string
   default     = ""
+}
+
+variable "enable_ssm" {
+  description = "Attach AmazonSSMManagedInstanceCore so operators reach the controller through SSM Session Manager without inbound SSH."
+  type        = bool
+  default     = true
 }
 
 variable "root_volume_size_gb" {

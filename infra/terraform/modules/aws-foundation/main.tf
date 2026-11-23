@@ -81,6 +81,14 @@ resource "aws_security_group" "runners" {
 
 data "aws_caller_identity" "current" {}
 
+# RunInstances only launches Spot through the API once this account-wide role exists.
+resource "aws_iam_service_linked_role" "spot" {
+  count            = var.create_spot_service_linked_role ? 1 : 0
+  aws_service_name = "spot.amazonaws.com"
+  description      = "Lets EC2 launch and manage open-ci Spot runners."
+  tags             = local.common_tags
+}
+
 data "aws_iam_policy_document" "controller" {
   statement {
     sid       = "DescribeInventory"
@@ -179,6 +187,61 @@ resource "aws_iam_policy" "controller" {
   tags        = local.common_tags
 }
 
+data "aws_iam_policy_document" "gcp_controller_federation" {
+  count = var.federate_gcp_controller ? 1 : 0
+
+  statement {
+    sid     = "GcpControllerServiceAccountOnly"
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = ["accounts.google.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "accounts.google.com:aud"
+      values   = [var.gcp_controller_service_account_unique_id]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "accounts.google.com:sub"
+      values   = [var.gcp_controller_service_account_unique_id]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "accounts.google.com:oaud"
+      values   = [var.web_identity_audience]
+    }
+  }
+}
+
+resource "aws_iam_role" "gcp_controller" {
+  count                = var.federate_gcp_controller ? 1 : 0
+  name                 = "${var.name_prefix}-gcp-controller"
+  description          = "Assumed keylessly by the GCP-hosted open-ci controller to manage AWS runners."
+  assume_role_policy   = data.aws_iam_policy_document.gcp_controller_federation[0].json
+  max_session_duration = 3600
+  tags                 = local.common_tags
+
+  lifecycle {
+    precondition {
+      condition     = can(regex("^[0-9]{10,32}$", var.gcp_controller_service_account_unique_id))
+      error_message = "federate_gcp_controller requires gcp_controller_service_account_unique_id (the numeric service account unique ID)."
+    }
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "gcp_controller" {
+  count      = var.federate_gcp_controller ? 1 : 0
+  role       = aws_iam_role.gcp_controller[0].name
+  policy_arn = aws_iam_policy.controller.arn
+}
+
 data "aws_iam_policy_document" "janitor_assume" {
   statement {
     effect  = "Allow"
@@ -252,8 +315,9 @@ resource "aws_lambda_function" "janitor" {
 
   environment {
     variables = {
-      OPEN_CI_AWS_ACCOUNT_ID = data.aws_caller_identity.current.account_id
-      JANITOR_DRY_RUN        = tostring(var.janitor_dry_run)
+      OPEN_CI_AWS_ACCOUNT_ID      = data.aws_caller_identity.current.account_id
+      JANITOR_DRY_RUN             = tostring(var.janitor_dry_run)
+      JANITOR_MAX_CEILING_SECONDS = tostring(var.janitor_max_lifetime_seconds)
     }
   }
 
