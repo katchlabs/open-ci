@@ -1,7 +1,8 @@
 //! AWS STS `AssumeRole` credential provider using native `SigV4` signing and XML parsing.
 
 use crate::credentials::{
-    AwsCredentialsSource, CachedCredentials, REFRESH_BUFFER_SECONDS, parse_rfc3339_unix,
+    AwsCredentialsSource, CachedCredentials, CredentialCache, map_transport_error,
+    parse_rfc3339_unix,
 };
 use crate::sigv4::{self, AwsCredentials};
 use crate::xml;
@@ -10,7 +11,6 @@ use open_ci_core::{Clock, SystemClock};
 use open_ci_provider::ProviderError;
 use reqwest::{Client, StatusCode};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Default global AWS STS endpoint.
 pub const DEFAULT_STS_ENDPOINT: &str = "https://sts.amazonaws.com/";
@@ -72,8 +72,7 @@ pub struct StsAssumeRoleCredentials {
     client: Client,
     config: AssumeRoleConfig,
     clock: Arc<dyn Clock>,
-    refresh_buffer_seconds: u64,
-    cached: RwLock<Option<CachedCredentials>>,
+    cache: CredentialCache,
 }
 
 impl StsAssumeRoleCredentials {
@@ -97,9 +96,8 @@ impl StsAssumeRoleCredentials {
             base,
             client,
             config,
+            cache: CredentialCache::new(Arc::clone(&clock)),
             clock,
-            refresh_buffer_seconds: REFRESH_BUFFER_SECONDS,
-            cached: RwLock::new(None),
         }
     }
 
@@ -187,65 +185,14 @@ impl StsAssumeRoleCredentials {
             req = req.header("x-amz-security-token", token.expose());
         }
 
-        let resp = req.send().await.map_err(|err| {
-            if err.is_timeout() {
-                ProviderError::Timeout
-            } else {
-                ProviderError::Transient("aws sts transport error".to_owned())
-            }
-        })?;
-
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|_| ProviderError::Transient("failed reading aws sts response".to_owned()))?;
-
-        if !status.is_success() {
-            return Err(classify_sts_error(status, &text));
-        }
-
-        let parsed = xml::parse_assume_role_credentials(&text).ok_or_else(|| {
-            ProviderError::Transient("missing credentials in STS AssumeRoleResponse".to_owned())
-        })?;
-        let expires_at_unix = parse_rfc3339_unix(&parsed.expiration_rfc3339)?;
-
-        Ok(CachedCredentials {
-            creds: AwsCredentials {
-                access_key_id: parsed.access_key_id,
-                secret_access_key: parsed.secret_access_key,
-                session_token: Some(parsed.session_token),
-            },
-            expires_at_unix,
-        })
+        read_sts_credentials(req.send().await, "AssumeRoleResponse").await
     }
 }
 
 #[async_trait]
 impl AwsCredentialsSource for StsAssumeRoleCredentials {
     async fn credentials(&self) -> Result<AwsCredentials, ProviderError> {
-        let now = self.clock.now_unix();
-        {
-            let guard = self.cached.read().await;
-            if let Some(entry) = guard.as_ref()
-                && entry.is_valid(now, self.refresh_buffer_seconds)
-            {
-                return Ok(entry.creds.clone());
-            }
-        }
-
-        let mut guard = self.cached.write().await;
-        let now = self.clock.now_unix();
-        if let Some(entry) = guard.as_ref()
-            && entry.is_valid(now, self.refresh_buffer_seconds)
-        {
-            return Ok(entry.creds.clone());
-        }
-
-        let refreshed = self.assume_role().await?;
-        let creds = refreshed.creds.clone();
-        *guard = Some(refreshed);
-        Ok(creds)
+        self.cache.get_or_refresh(|| self.assume_role()).await
     }
 }
 
@@ -264,13 +211,43 @@ fn infer_sts_region(host: &str) -> String {
     DEFAULT_STS_SIGNING_REGION.to_owned()
 }
 
+/// Reads an STS credential response, classifying transport, HTTP and XML errors.
+pub(crate) async fn read_sts_credentials(
+    sent: Result<reqwest::Response, reqwest::Error>,
+    response_name: &str,
+) -> Result<CachedCredentials, ProviderError> {
+    let resp = sent.map_err(|err| map_transport_error(&err, "aws sts"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|_| ProviderError::Transient("failed reading aws sts response".to_owned()))?;
+    if !status.is_success() {
+        return Err(classify_sts_error(status, &text));
+    }
+    let parsed = xml::parse_assume_role_credentials(&text).ok_or_else(|| {
+        ProviderError::Transient(format!("missing credentials in STS {response_name}"))
+    })?;
+    Ok(CachedCredentials {
+        expires_at_unix: parse_rfc3339_unix(&parsed.expiration_rfc3339)?,
+        creds: AwsCredentials {
+            access_key_id: parsed.access_key_id,
+            secret_access_key: parsed.secret_access_key,
+            session_token: Some(parsed.session_token),
+        },
+    })
+}
+
 fn classify_sts_error(status: StatusCode, xml_body: &str) -> ProviderError {
     let code = xml::parse_error_code(xml_body).unwrap_or_default();
     match code.as_str() {
         "AccessDenied"
         | "AuthFailure"
         | "ExpiredToken"
+        | "ExpiredTokenException"
+        | "IDPRejectedClaim"
         | "InvalidClientTokenId"
+        | "InvalidIdentityToken"
         | "SignatureDoesNotMatch" => ProviderError::AuthFailed,
         "Throttling" | "RequestLimitExceeded" => ProviderError::RateLimited {
             retry_after_seconds: 30,

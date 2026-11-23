@@ -14,9 +14,11 @@ use async_trait::async_trait;
 use open_ci_core::{Clock, SecretString, SystemClock};
 use open_ci_provider::ProviderError;
 use reqwest::Client;
+use std::future::Future;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::sync::RwLock;
 
 pub(crate) const REFRESH_BUFFER_SECONDS: u64 = 60;
 
@@ -29,6 +31,59 @@ pub(crate) struct CachedCredentials {
 impl CachedCredentials {
     pub(crate) fn is_valid(&self, now_unix: u64, buffer_seconds: u64) -> bool {
         now_unix.saturating_add(buffer_seconds) < self.expires_at_unix
+    }
+}
+
+/// Maps a credential-endpoint transport failure without leaking request details.
+pub(crate) fn map_transport_error(err: &reqwest::Error, endpoint: &str) -> ProviderError {
+    if err.is_timeout() {
+        ProviderError::Timeout
+    } else {
+        ProviderError::Transient(format!("{endpoint} transport error"))
+    }
+}
+
+/// Holds temporary credentials and refreshes them once, under a write lock,
+/// shortly before they expire.
+#[derive(Debug)]
+pub(crate) struct CredentialCache {
+    clock: Arc<dyn Clock>,
+    cached: RwLock<Option<CachedCredentials>>,
+}
+
+impl CredentialCache {
+    pub(crate) fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            clock,
+            cached: RwLock::new(None),
+        }
+    }
+
+    pub(crate) async fn get_or_refresh<F, Fut>(
+        &self,
+        refresh: F,
+    ) -> Result<AwsCredentials, ProviderError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<CachedCredentials, ProviderError>>,
+    {
+        if let Some(creds) = self.fresh(self.cached.read().await.as_ref()) {
+            return Ok(creds);
+        }
+        let mut guard = self.cached.write().await;
+        if let Some(creds) = self.fresh(guard.as_ref()) {
+            return Ok(creds);
+        }
+        let refreshed = refresh().await?;
+        let creds = refreshed.creds.clone();
+        *guard = Some(refreshed);
+        Ok(creds)
+    }
+
+    fn fresh(&self, entry: Option<&CachedCredentials>) -> Option<AwsCredentials> {
+        entry
+            .filter(|e| e.is_valid(self.clock.now_unix(), REFRESH_BUFFER_SECONDS))
+            .map(|e| e.creds.clone())
     }
 }
 

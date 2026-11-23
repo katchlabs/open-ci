@@ -1,6 +1,8 @@
 //! EC2 `IMDSv2` temporary IAM role credential provider.
 
-use crate::credentials::{CachedCredentials, REFRESH_BUFFER_SECONDS, parse_rfc3339_unix};
+use crate::credentials::{
+    CachedCredentials, CredentialCache, map_transport_error, parse_rfc3339_unix,
+};
 use crate::sigv4::AwsCredentials;
 use async_trait::async_trait;
 use open_ci_core::{Clock, SecretString, SystemClock};
@@ -8,7 +10,6 @@ use open_ci_provider::ProviderError;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Standard EC2 Instance Metadata Service (`IMDSv2`) link-local endpoint.
 pub const DEFAULT_IMDS_BASE_URL: &str = "http://169.254.169.254";
@@ -31,9 +32,7 @@ struct ImdsRoleCredentialsDto {
 pub struct ImdsAwsCredentials {
     client: Client,
     metadata_base_url: String,
-    clock: Arc<dyn Clock>,
-    refresh_buffer_seconds: u64,
-    cached: RwLock<Option<CachedCredentials>>,
+    cache: CredentialCache,
 }
 
 impl ImdsAwsCredentials {
@@ -57,9 +56,7 @@ impl ImdsAwsCredentials {
         Self {
             client,
             metadata_base_url: base,
-            clock,
-            refresh_buffer_seconds: REFRESH_BUFFER_SECONDS,
-            cached: RwLock::new(None),
+            cache: CredentialCache::new(clock),
         }
     }
 
@@ -71,7 +68,7 @@ impl ImdsAwsCredentials {
             .header(IMDS_TOKEN_TTL_HEADER, DEFAULT_TOKEN_TTL_SECONDS)
             .send()
             .await
-            .map_err(|err| map_transport_error(&err))?;
+            .map_err(|err| map_transport_error(&err, "aws imds"))?;
 
         let status = resp.status();
         let body = resp
@@ -98,7 +95,7 @@ impl ImdsAwsCredentials {
             .header(IMDS_TOKEN_HEADER, token)
             .send()
             .await
-            .map_err(|err| map_transport_error(&err))?;
+            .map_err(|err| map_transport_error(&err, "aws imds"))?;
 
         let status = resp.status();
         let body = resp
@@ -132,7 +129,7 @@ impl ImdsAwsCredentials {
             .header(IMDS_TOKEN_HEADER, &token)
             .send()
             .await
-            .map_err(|err| map_transport_error(&err))?;
+            .map_err(|err| map_transport_error(&err, "aws imds"))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -167,28 +164,7 @@ impl ImdsAwsCredentials {
 #[async_trait]
 impl crate::credentials::AwsCredentialsSource for ImdsAwsCredentials {
     async fn credentials(&self) -> Result<AwsCredentials, ProviderError> {
-        let now = self.clock.now_unix();
-        {
-            let guard = self.cached.read().await;
-            if let Some(entry) = guard.as_ref()
-                && entry.is_valid(now, self.refresh_buffer_seconds)
-            {
-                return Ok(entry.creds.clone());
-            }
-        }
-
-        let mut guard = self.cached.write().await;
-        let now = self.clock.now_unix();
-        if let Some(entry) = guard.as_ref()
-            && entry.is_valid(now, self.refresh_buffer_seconds)
-        {
-            return Ok(entry.creds.clone());
-        }
-
-        let refreshed = self.fetch_credentials().await?;
-        let creds = refreshed.creds.clone();
-        *guard = Some(refreshed);
-        Ok(creds)
+        self.cache.get_or_refresh(|| self.fetch_credentials()).await
     }
 }
 
@@ -200,14 +176,6 @@ fn is_safe_role_name(role: &str) -> bool {
         && role.bytes().all(|b| {
             b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+' | b'=' | b',' | b'@')
         })
-}
-
-fn map_transport_error(err: &reqwest::Error) -> ProviderError {
-    if err.is_timeout() {
-        ProviderError::Timeout
-    } else {
-        ProviderError::Transient("aws imds transport error".to_owned())
-    }
 }
 
 fn check_imds_status(status: StatusCode) -> Result<(), ProviderError> {
