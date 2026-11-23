@@ -2,11 +2,15 @@
 
 mod imds;
 mod sts;
+mod web_identity;
 
 pub use imds::{DEFAULT_IMDS_BASE_URL, ImdsAwsCredentials};
 pub use sts::{
     AssumeRoleConfig, DEFAULT_ASSUME_ROLE_DURATION_SECONDS, DEFAULT_STS_ENDPOINT,
     StsAssumeRoleCredentials,
+};
+pub use web_identity::{
+    DEFAULT_GCE_METADATA_BASE_URL, GceWebIdentityCredentials, WebIdentityConfig,
 };
 
 use crate::sigv4::AwsCredentials;

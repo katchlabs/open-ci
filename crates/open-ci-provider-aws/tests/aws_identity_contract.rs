@@ -4,15 +4,15 @@ use async_trait::async_trait;
 use axum::{
     Router,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     routing::{get, post, put},
 };
 use open_ci_core::{ManualClock, SecretString};
 use open_ci_provider::ProviderError;
 use open_ci_provider_aws::sigv4::AwsCredentials;
 use open_ci_provider_aws::{
-    AssumeRoleConfig, AwsCredentialChain, AwsCredentialsSource, ImdsAwsCredentials,
-    StaticAwsCredentials, StsAssumeRoleCredentials,
+    AssumeRoleConfig, AwsCredentialChain, AwsCredentialsSource, GceWebIdentityCredentials,
+    ImdsAwsCredentials, StaticAwsCredentials, StsAssumeRoleCredentials, WebIdentityConfig,
 };
 use reqwest::Client;
 use std::net::SocketAddr;
@@ -394,4 +394,296 @@ async fn credential_chain_prefers_primary_when_available() {
 
 fn panic_free_fail(msg: &str) {
     assert_eq!(msg, "");
+}
+
+const FAKE_GCE_ID_TOKEN: &str = "eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJzdHM6b3Blbi1jaSJ9.c2ln";
+const WEB_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/open-ci-gcp-controller";
+
+#[derive(Clone)]
+struct WebIdentityState {
+    metadata_calls: Arc<AtomicUsize>,
+    sts_calls: Arc<AtomicUsize>,
+    metadata_status: StatusCode,
+    metadata_flavor: Option<&'static str>,
+    identity_token: &'static str,
+    sts_error: Option<(StatusCode, &'static str)>,
+}
+
+impl Default for WebIdentityState {
+    fn default() -> Self {
+        Self {
+            metadata_calls: Arc::default(),
+            sts_calls: Arc::default(),
+            metadata_status: StatusCode::OK,
+            metadata_flavor: Some("Google"),
+            identity_token: FAKE_GCE_ID_TOKEN,
+            sts_error: None,
+        }
+    }
+}
+
+async fn fake_gce_identity(
+    State(st): State<WebIdentityState>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    assert_eq!(
+        headers.get("metadata-flavor").and_then(|v| v.to_str().ok()),
+        Some("Google")
+    );
+    let query = query.unwrap_or_default();
+    assert!(query.contains("audience=sts%3Aopen-ci"));
+    assert!(query.contains("format=full"));
+    st.metadata_calls.fetch_add(1, Ordering::SeqCst);
+    let mut response = (st.metadata_status, st.identity_token).into_response();
+    if let Some(flavor) = st.metadata_flavor {
+        response
+            .headers_mut()
+            .insert("metadata-flavor", HeaderValue::from_static(flavor));
+    }
+    response
+}
+
+async fn fake_sts_web_identity(
+    State(st): State<WebIdentityState>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    let call = st.sts_calls.fetch_add(1, Ordering::SeqCst) + 1;
+    assert!(headers.get("authorization").is_none());
+    assert!(headers.get("x-amz-security-token").is_none());
+    assert_eq!(
+        headers.get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/x-www-form-urlencoded; charset=utf-8")
+    );
+    for expected in [
+        "Action=AssumeRoleWithWebIdentity",
+        "Version=2011-06-15",
+        "RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fopen-ci-gcp-controller",
+        "RoleSessionName=open-ci",
+        "DurationSeconds=3600",
+    ] {
+        assert!(body.contains(expected), "missing {expected}");
+    }
+    assert!(body.contains(&format!("WebIdentityToken={FAKE_GCE_ID_TOKEN}")));
+    assert!(!body.contains("ExternalId"));
+    if let Some((status, code)) = st.sts_error {
+        return (
+            status,
+            format!("<ErrorResponse><Error><Code>{code}</Code></Error></ErrorResponse>"),
+        );
+    }
+    let exp = if call == 1 {
+        "2023-11-14T22:23:20Z"
+    } else {
+        "2023-11-14T23:23:20Z"
+    };
+    (
+        StatusCode::OK,
+        format!(
+            "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult>\
+             <SubjectFromWebIdentityToken>1234</SubjectFromWebIdentityToken>\
+             <Credentials><AccessKeyId>ASIA_WEB_{call}</AccessKeyId>\
+             <SecretAccessKey>WEB_SECRET_{call}</SecretAccessKey>\
+             <SessionToken>WEB_TOK_{call}</SessionToken>\
+             <Expiration>{exp}</Expiration></Credentials>\
+             </AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>"
+        ),
+    )
+}
+
+fn web_identity_config(addr: SocketAddr) -> WebIdentityConfig {
+    WebIdentityConfig::new(WEB_ROLE_ARN, "open-ci", "sts:open-ci")
+        .with_sts_endpoint(format!("http://{addr}/"))
+        .with_metadata_base_url(format!("http://{addr}"))
+}
+
+async fn spawn_web_identity(state: &WebIdentityState) -> Option<SocketAddr> {
+    let app = Router::new()
+        .route(
+            "/computeMetadata/v1/instance/service-accounts/default/identity",
+            get(fake_gce_identity),
+        )
+        .route("/", post(fake_sts_web_identity))
+        .with_state(state.clone());
+    spawn_mock_server(app).await
+}
+
+async fn web_identity_result(state: WebIdentityState) -> Option<Result<(), ProviderError>> {
+    let addr = spawn_web_identity(&state).await?;
+    let source = GceWebIdentityCredentials::with_clock(
+        Client::new(),
+        web_identity_config(addr),
+        Arc::new(ManualClock::new(1_700_000_000)),
+    );
+    Some(source.credentials().await.map(|_| ()))
+}
+
+#[tokio::test]
+async fn gce_web_identity_exchanges_unsigned_caches_and_refreshes() {
+    let state = WebIdentityState::default();
+    let Some(addr) = spawn_web_identity(&state).await else {
+        panic_free_fail("failed to bind web identity mock server");
+        return;
+    };
+    let clock = Arc::new(ManualClock::new(1_700_000_000));
+    let source = GceWebIdentityCredentials::with_clock(
+        Client::new(),
+        web_identity_config(addr),
+        Arc::clone(&clock) as Arc<dyn open_ci_core::Clock>,
+    );
+
+    let first = source.credentials().await;
+    assert!(matches!(&first, Ok(c) if c.access_key_id == "ASIA_WEB_1"
+        && c.secret_access_key.expose() == "WEB_SECRET_1"
+        && c.session_token.as_ref().map(SecretString::expose) == Some("WEB_TOK_1")));
+
+    clock.advance(500);
+    assert!(source.credentials().await.is_ok());
+    assert_eq!(state.sts_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.metadata_calls.load(Ordering::SeqCst), 1);
+
+    clock.advance(40);
+    let refreshed = source.credentials().await;
+    assert!(matches!(&refreshed, Ok(c) if c.access_key_id == "ASIA_WEB_2"));
+    assert_eq!(state.sts_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.metadata_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn gce_web_identity_maps_sts_error_codes() {
+    for (status, code, expected) in [
+        (
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            ProviderError::AuthFailed,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            "InvalidIdentityToken",
+            ProviderError::AuthFailed,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            "IDPRejectedClaim",
+            ProviderError::AuthFailed,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            "ExpiredTokenException",
+            ProviderError::AuthFailed,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            "Throttling",
+            ProviderError::RateLimited {
+                retry_after_seconds: 30,
+            },
+        ),
+    ] {
+        let state = WebIdentityState {
+            sts_error: Some((status, code)),
+            ..WebIdentityState::default()
+        };
+        assert_eq!(
+            web_identity_result(state).await,
+            Some(Err(expected)),
+            "{code}"
+        );
+    }
+}
+
+/// Runs one exchange and reports its error message plus metadata/STS call counts.
+async fn rejected_exchange(state: WebIdentityState) -> Option<(String, usize, usize)> {
+    let (metadata_calls, sts_calls) = (
+        Arc::clone(&state.metadata_calls),
+        Arc::clone(&state.sts_calls),
+    );
+    let message = match web_identity_result(state).await? {
+        Err(ProviderError::Transient(message)) => message,
+        other => format!("unexpected outcome: {other:?}"),
+    };
+    Some((
+        message,
+        metadata_calls.load(Ordering::SeqCst),
+        sts_calls.load(Ordering::SeqCst),
+    ))
+}
+
+#[tokio::test]
+async fn gce_web_identity_maps_missing_service_account_to_auth_failed() {
+    let state = WebIdentityState {
+        metadata_status: StatusCode::NOT_FOUND,
+        ..WebIdentityState::default()
+    };
+    assert_eq!(
+        web_identity_result(state).await,
+        Some(Err(ProviderError::AuthFailed))
+    );
+}
+
+#[tokio::test]
+async fn gce_web_identity_rejects_responses_not_from_gce_metadata() {
+    for flavor in [None, Some("nginx")] {
+        let state = WebIdentityState {
+            metadata_flavor: flavor,
+            ..WebIdentityState::default()
+        };
+        let outcome = rejected_exchange(state).await;
+        assert!(
+            matches!(&outcome, Some((msg, 1, 0)) if msg.contains("not from the GCE metadata server")),
+            "{flavor:?}: {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gce_web_identity_rejects_malformed_identity_tokens_before_sts() {
+    for malformed in ["..", "a..b", "a.b", "a.b.c.d", "a.b.c d"] {
+        let state = WebIdentityState {
+            identity_token: malformed,
+            ..WebIdentityState::default()
+        };
+        let outcome = rejected_exchange(state).await;
+        assert!(
+            matches!(&outcome, Some((msg, 1, 0)) if msg == "malformed gce identity token"),
+            "{malformed}: {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gce_web_identity_rejects_invalid_config_before_any_request() {
+    let state = WebIdentityState::default();
+    let Some(addr) = spawn_web_identity(&state).await else {
+        panic_free_fail("failed to bind web identity mock server");
+        return;
+    };
+    let base = web_identity_config(addr);
+    for config in [
+        WebIdentityConfig {
+            role_arn: String::new(),
+            ..base.clone()
+        },
+        WebIdentityConfig {
+            role_session_name: " ".to_owned(),
+            ..base.clone()
+        },
+        WebIdentityConfig {
+            audience: String::new(),
+            ..base.clone()
+        },
+        base.clone().with_duration_seconds(0),
+        base.clone().with_sts_endpoint("not a url"),
+        base.clone().with_sts_endpoint("mailto:a@b"),
+        base.clone().with_metadata_base_url("file:///etc"),
+    ] {
+        let source = GceWebIdentityCredentials::new(Client::new(), config);
+        assert!(matches!(
+            source.credentials().await,
+            Err(ProviderError::InvalidConfig(_))
+        ));
+    }
+    assert_eq!(state.metadata_calls.load(Ordering::SeqCst), 0);
 }

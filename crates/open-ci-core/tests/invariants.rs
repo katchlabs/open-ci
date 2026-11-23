@@ -1,11 +1,12 @@
 //! Property-based mathematical invariant proofs for `open-ci-core`.
 
+use open_ci_core::ConfigError;
 use open_ci_core::admission::{
     AdmissionContext, evaluate_admission, evaluate_webhook_admission, requested_capacity,
 };
 use open_ci_core::config::{
-    AdmissionConfig, CacheServiceConfig, GitHubConfig, Guardrails, OidcTrustConfig, OpenCiConfig,
-    Placement, PoolConfig, ServerConfig,
+    AdmissionConfig, AwsProviderConfig, CacheServiceConfig, GitHubConfig, Guardrails,
+    OidcTrustConfig, OpenCiConfig, Placement, PoolConfig, ServerConfig,
 };
 use open_ci_core::models::{
     AdmissionMode, AdmissionReason, AdmissionRecord, AdmissionRequest, AdmissionStatus,
@@ -566,6 +567,80 @@ fn workers_get_the_cache_url_only_when_their_pool_opts_in() -> Result<(), Box<dy
         "transparent_cache requires a [cache] section"
     );
     Ok(())
+}
+
+fn federated_aws() -> AwsProviderConfig {
+    AwsProviderConfig {
+        account_id: "123456789012".to_owned(),
+        endpoint_url: None,
+        role_arn: Some("arn:aws:iam::123456789012:role/open-ci-gcp-controller".to_owned()),
+        external_id: None,
+        role_session_name: None,
+        web_identity_audience: Some("open-ci-aws-federation".to_owned()),
+    }
+}
+
+fn invalid_aws_field(aws: AwsProviderConfig) -> Option<&'static str> {
+    let mut cfg = sample_config(32, 16, 500);
+    cfg.aws = Some(aws);
+    match cfg.validate() {
+        Err(ConfigError::Invalid { field, .. }) => Some(field),
+        _ => None,
+    }
+}
+
+#[test]
+fn aws_web_identity_accepts_a_same_account_role() {
+    assert_eq!(invalid_aws_field(federated_aws()), None);
+    let nested_path = AwsProviderConfig {
+        role_arn: Some("arn:aws:iam::123456789012:role/team/ci/open-ci".to_owned()),
+        ..federated_aws()
+    };
+    assert_eq!(invalid_aws_field(nested_path), None);
+}
+
+#[test]
+fn aws_web_identity_rejects_each_invalid_setting_without_aws_placements() {
+    let cases = [
+        ("", "aws.web_identity_audience"),
+        ("has space", "aws.web_identity_audience"),
+        (&"a".repeat(201), "aws.web_identity_audience"),
+    ];
+    for (audience, field) in cases {
+        let aws = AwsProviderConfig {
+            web_identity_audience: Some(audience.to_owned()),
+            ..federated_aws()
+        };
+        assert_eq!(invalid_aws_field(aws), Some(field), "audience {audience:?}");
+    }
+    for role_arn in [
+        None,
+        Some("arn:aws:iam::999999999999:role/open-ci-gcp-controller"),
+        Some("arn:aws:iam::123456789012:role/"),
+        Some("arn:aws:iam::123456789012:user/open-ci"),
+        Some("arn:aws:iam::123456789012:role//open-ci"),
+        Some("arn:aws:iam::123456789012:role/bad path/open-ci"),
+        Some("arn:aws:iam::123456789012:role/a\nb/open-ci"),
+    ] {
+        let aws = AwsProviderConfig {
+            role_arn: role_arn.map(str::to_owned),
+            ..federated_aws()
+        };
+        assert_eq!(invalid_aws_field(aws), Some("aws.role_arn"), "{role_arn:?}");
+    }
+    let with_external_id = AwsProviderConfig {
+        external_id: Some("tenant".to_owned()),
+        ..federated_aws()
+    };
+    assert_eq!(invalid_aws_field(with_external_id), Some("aws.external_id"));
+    let bad_session = AwsProviderConfig {
+        role_session_name: Some("x".to_owned()),
+        ..federated_aws()
+    };
+    assert_eq!(
+        invalid_aws_field(bad_session),
+        Some("aws.role_session_name")
+    );
 }
 
 fn live_worker(created_at: u64, bootstrap_used: bool) -> Worker {

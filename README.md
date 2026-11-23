@@ -208,7 +208,7 @@ We prefer clear engineering boundaries over marketing claims:
 | ✓ | `webhook`, `oidc`, and `hybrid` admission modes | Drop-in webhooks or fail-closed `actions/route` |
 | ✓ | Native GitHub Actions v2 transparent cache (`open-ci cache`) | Local NVMe, native S3 / R2 / MinIO, and native GCS; verified with the official `@actions/cache` client |
 | ✓ | Auto-NVMe RAID0/ext4 boot setup & BuildKit tuning | `x64` and `arm64` Ubuntu 24.04 Packer images |
-| ✓ | BYOC cross-account AWS `AssumeRole` & GCP SA impersonation | `ExternalId` support, EC2 IMDSv2, GCE metadata |
+| ✓ | BYOC cross-account AWS `AssumeRole` & GCP SA impersonation | `ExternalId` support, EC2 IMDSv2, GCE metadata, keyless GCP→AWS web identity |
 | ✓ | Turnkey Terraform modules & automated multi-arch releases | `aws-controller`, `gcp-controller`, GHCR + `.tar.gz` |
 | ○ | `PostgresStore` implementation for active-active HA | Same async `Store` trait; zero domain changes |
 | ○ | Operator Web UI | Backed by existing `/api/v1/*` REST + `/api/v1/events` SSE |

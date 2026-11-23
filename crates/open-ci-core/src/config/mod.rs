@@ -123,6 +123,11 @@ pub struct AwsProviderConfig {
     /// Optional STS role session name (defaults to `open-ci`).
     #[serde(default)]
     pub role_session_name: Option<String>,
+    /// Keyless federation for controllers on GCP: exchange the host's GCE identity
+    /// token (requested with this audience) for `role_arn` via STS
+    /// `AssumeRoleWithWebIdentity`, instead of env keys or `IMDSv2`.
+    #[serde(default)]
+    pub web_identity_audience: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
