@@ -19,6 +19,9 @@ struct MockState {
     faults: VecDeque<ProviderError>,
     healthy: bool,
     op_counter: u64,
+    sync_launches: bool,
+    reads_hidden_after_launch: usize,
+    hidden_reads: BTreeMap<String, usize>,
 }
 
 /// Thread-safe in-memory [`CloudProvider`] supporting deterministic fault injection.
@@ -51,6 +54,17 @@ impl MockProvider {
 
     pub async fn inject_create_fault(&self, error: ProviderError) {
         self.state.lock().await.faults.push_back(error);
+    }
+
+    /// Mimics EC2: launches complete synchronously and return no operation.
+    pub async fn set_sync_launches(&self, enabled: bool) {
+        self.state.lock().await.sync_launches = enabled;
+    }
+
+    /// Mimics EC2 eventual consistency: each new instance is invisible to
+    /// `get_instance` for the given number of lookups after launch.
+    pub async fn hide_new_instances_for_reads(&self, reads: usize) {
+        self.state.lock().await.reads_hidden_after_launch = reads;
     }
 
     pub async fn preempt_instance(&self, name: &str) {
@@ -96,7 +110,14 @@ impl CloudProvider for MockProvider {
         worker_name: &str,
         _provider_instance_id: Option<&str>,
     ) -> Result<Option<CloudInstance>, ProviderError> {
-        Ok(self.state.lock().await.instances.get(worker_name).cloned())
+        let mut guard = self.state.lock().await;
+        if let Some(remaining) = guard.hidden_reads.get_mut(worker_name)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Ok(None);
+        }
+        Ok(guard.instances.get(worker_name).cloned())
     }
 
     async fn list_instances(
@@ -165,9 +186,14 @@ impl CloudProvider for MockProvider {
                 status: "READY".to_owned(),
             },
         );
+        if guard.reads_hidden_after_launch > 0 {
+            let reads = guard.reads_hidden_after_launch;
+            guard.hidden_reads.insert(spec.worker_name.clone(), reads);
+        }
+        let operation = (!guard.sync_launches).then_some(OperationRef(op_name));
         Ok(CreateReceipt {
             provider_instance_id: Some(provider_id),
-            operation: Some(OperationRef(op_name)),
+            operation,
         })
     }
 
@@ -187,6 +213,7 @@ impl CloudProvider for MockProvider {
     ) -> Result<Option<OperationRef>, ProviderError> {
         let mut guard = self.state.lock().await;
         let existed = guard.instances.remove(worker_name).is_some();
+        guard.hidden_reads.remove(worker_name);
         if let Some(disk) = guard.disks.get_mut(worker_name) {
             disk.attached = false;
         }

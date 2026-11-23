@@ -50,6 +50,25 @@ pub fn transition_phase(
     Ok(())
 }
 
+/// Window after launch in which a cloud API may not yet list a new instance.
+///
+/// EC2 is eventually consistent: `DescribeInstances` can return
+/// `InvalidInstanceID.NotFound` for an instance `RunInstances` just created.
+pub const LAUNCH_VISIBILITY_GRACE_SECONDS: u64 = 90;
+
+/// Whether an instance the provider cannot list has really been lost.
+///
+/// A bootstrapped worker already proved its instance existed, so its absence
+/// (including AWS filtering out `terminated` Spot instances) is a loss at once.
+/// An unbootstrapped launch is only lost after the visibility grace elapses.
+pub const fn missing_instance_is_lost(worker: &Worker, now_unix: u64) -> bool {
+    worker.bootstrap_used
+        || now_unix
+            >= worker
+                .created_at
+                .saturating_add(LAUNCH_VISIBILITY_GRACE_SECONDS)
+}
+
 /// Evaluates whether a live/creating worker must retire based on authoritative state.
 pub fn evaluate_retirement(
     pool: &PoolConfig,
