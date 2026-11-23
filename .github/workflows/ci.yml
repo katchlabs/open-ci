@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (lint, purity, tests, runtime smoke, policy)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check verify.sh and drive.sh syntax
+        run: bash -n scripts/verify.sh .agents/skills/verify-open-ci/scripts/drive.sh
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy strict check
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Enforce zero #[allow( attributes in crates/
+        run: |
+          if grep -rn '#\[allow(' crates/; then
+            echo "ERROR: #[allow( attributes are forbidden in crates/" >&2
+            exit 1
+          fi
+      - name: Enforce open-ci-core hexagonal purity
+        run: |
+          if cargo tree -p open-ci-core -e normal | grep -E '(^|[[:space:]])(tokio|reqwest|rusqlite|axum|hyper)[[:space:]]'; then
+            echo "ERROR: open-ci-core must remain zero-I/O (forbidden dependency detected)" >&2
+            exit 1
+          fi
+      - name: Run unit, invariant, contract, and e2e tests
+        run: cargo test --workspace
+      - name: Validate example configuration
+        run: cargo run --bin open-ci -- validate --config config/open-ci.example.toml
+      - name: Compiled-binary runtime smoke proof (HTTP + SQLite DB side effects)
+        run: ./.agents/skills/verify-open-ci/scripts/drive.sh
+      - name: Security policy & route/doc parity checks
+        run: |
+          set -euo pipefail
+          grep -Eq 'http_tokens[[:space:]]*=[[:space:]]*"required"' infra/terraform/modules/aws-controller/main.tf
+          grep -Eq '"MetadataOptions\.HttpTokens",[[:space:]]*"required"' crates/open-ci-provider-aws/src/params.rs
+          grep -Fq '"serviceAccounts": []' crates/open-ci-provider-gcp/src/dto.rs
+          ROUTES="$(awk '/\.route\(/ { line=$0; while (line !~ /"\/[^"]*"/ && (getline n) > 0) line=line " " n; if (match(line, /"\/[^"]*"/)) print substr(line, RSTART+1, RLENGTH-2); }' crates/open-ci-server/src/http/*.rs | sort -u)"
+          MISSING=0
+          while IFS= read -r route; do
+            if ! grep -Fq -- "$route" docs/architecture.md; then
+              echo "MISSING in docs/architecture.md: ${route}" >&2
+              MISSING=$((MISSING + 1))
+            fi
+          done <<< "$ROUTES"
+          test "$MISSING" -eq 0
+
+  typescript-action:
+    name: TypeScript Routing Action
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run route action tests
+        working-directory: actions/route
+        run: node --test test/route.test.ts
+
+  iac:
+    name: Terraform & Packer Validation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.4"
+          terraform_wrapper: false
+      - name: Terraform format check
+        run: terraform fmt -check -recursive infra/terraform
+      - name: Terraform validate modules and examples
+        run: |
+          for dir in \
+            infra/terraform/modules/gcp-foundation \
+            infra/terraform/modules/gcp-controller \
+            infra/terraform/modules/aws-foundation \
+            infra/terraform/modules/aws-controller \
+            infra/terraform/examples/aws-controller \
+            infra/terraform/examples/gcp-quickstart \
+            infra/terraform/examples/multi-cloud; do
+            echo "::group::Validate ${dir}"
+            terraform -chdir="${dir}" init -backend=false -input=false
+            terraform -chdir="${dir}" validate
+            echo "::endgroup::"
+          done
+      - name: ShellCheck runner provisioning scripts
+        run: |
+          bash -n infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh
+          shellcheck infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh
