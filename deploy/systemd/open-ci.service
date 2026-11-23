@@ -1,7 +1,7 @@
 [Unit]
 Description=open-ci Control Plane
-After=network-online.target
-Wants=network-online.target
+After=network-online.target open-ci-credentials.service
+Wants=network-online.target open-ci-credentials.service
 
 [Service]
 Type=simple
@@ -28,8 +28,6 @@ LockPersonality=true
 ReadWritePaths=/var/lib/open-ci
 ReadOnlyPaths=/etc/open-ci /run/open-ci
 StateDirectory=open-ci
-RuntimeDirectory=open-ci
-RuntimeDirectoryPreserve=yes
 UMask=0077
 
 [Install]

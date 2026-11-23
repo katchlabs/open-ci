@@ -142,6 +142,15 @@ if ! grep -Fq '"serviceAccounts": []' crates/open-ci-provider-gcp/src/dto.rs; th
 fi
 echo "  ok: policy check GCP provider \"serviceAccounts\": [] (zero-IAM runners)"
 
+if grep -Eq '^RuntimeDirectory=open-ci' deploy/systemd/open-ci.service; then
+  fail "Policy check failed: remove RuntimeDirectory=open-ci from deploy/systemd/open-ci.service so open-ci-credentials.service (open-ci-broker) retains write ownership of /run/open-ci."
+fi
+if ! grep -Eq '^RuntimeDirectory=open-ci' deploy/systemd/open-ci-credentials.service \
+  || ! grep -Eq '^RuntimeDirectoryMode=0750' deploy/systemd/open-ci-credentials.service; then
+  fail "Policy check failed: deploy/systemd/open-ci-credentials.service must own RuntimeDirectory=open-ci with RuntimeDirectoryMode=0750."
+fi
+echo "  ok: policy check systemd /run/open-ci owned by open-ci-credentials.service (0750)"
+
 # ---------------------------------------------------------------------------
 # Gate 7: Route & Doc Parity
 # ---------------------------------------------------------------------------
