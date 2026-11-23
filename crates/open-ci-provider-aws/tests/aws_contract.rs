@@ -103,6 +103,7 @@ fn test_provider(addr: SocketAddr) -> AwsProvider {
             role_arn: None,
             external_id: None,
             role_session_name: None,
+            web_identity_audience: None,
         },
         Client::new(),
         Arc::new(StaticAwsCredentials(AwsCredentials {

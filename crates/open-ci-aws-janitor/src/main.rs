@@ -58,6 +58,7 @@ async fn main() -> ExitCode {
             role_arn: None,
             external_id: None,
             role_session_name: None,
+            web_identity_audience: None,
         },
         http.clone(),
         Arc::new(EnvAwsCredentials),

@@ -1,8 +1,8 @@
 //! Offline configuration validators for [`OpenCiConfig`].
 
 use super::{
-    AwsCredentialsConfig, CacheStorageConfig, GcpCredentialsConfig, OidcTrustConfig, OpenCiConfig,
-    Placement, PoolConfig, RepositoryAllowlist,
+    AwsCredentialsConfig, AwsProviderConfig, CacheStorageConfig, GcpCredentialsConfig,
+    OidcTrustConfig, OpenCiConfig, Placement, PoolConfig, RepositoryAllowlist,
 };
 use crate::error::ConfigError;
 use crate::models::{GitHubScope, ProviderKind, is_valid_github_segment, split_repository};
@@ -13,6 +13,7 @@ pub(super) fn validate_config(cfg: &OpenCiConfig) -> Result<(), ConfigError> {
     validate_server(cfg)?;
     validate_github(cfg)?;
     validate_cache(cfg)?;
+    validate_aws(cfg)?;
     validate_admission(cfg)?;
     validate_pools(cfg)?;
     Ok(())
@@ -614,14 +615,10 @@ fn validate_gcp_placement(cfg: &OpenCiConfig, placement: &Placement) -> Result<(
 }
 
 fn validate_aws_placement(cfg: &OpenCiConfig, placement: &Placement) -> Result<(), ConfigError> {
-    let aws = cfg
-        .aws
-        .as_ref()
-        .ok_or_else(|| ConfigError::invalid("aws", "aws config required for AWS placements"))?;
-    if aws.account_id.len() != 12 || !aws.account_id.bytes().all(|b| b.is_ascii_digit()) {
+    if cfg.aws.is_none() {
         return Err(ConfigError::invalid(
-            "aws.account_id",
-            "must be a 12-digit AWS account ID",
+            "aws",
+            "aws config required for AWS placements",
         ));
     }
     if placement
@@ -645,6 +642,82 @@ fn validate_aws_placement(cfg: &OpenCiConfig, placement: &Placement) -> Result<(
         ));
     }
     Ok(())
+}
+
+fn validate_aws(cfg: &OpenCiConfig) -> Result<(), ConfigError> {
+    let Some(aws) = &cfg.aws else {
+        return Ok(());
+    };
+    if aws.account_id.len() != 12 || !aws.account_id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ConfigError::invalid(
+            "aws.account_id",
+            "must be a 12-digit AWS account ID",
+        ));
+    }
+    if aws
+        .role_session_name
+        .as_deref()
+        .is_some_and(|name| !is_iam_name(name, 2, 64))
+    {
+        return Err(ConfigError::invalid(
+            "aws.role_session_name",
+            "must be 2-64 characters of [A-Za-z0-9+=,.@_-]",
+        ));
+    }
+    match &aws.web_identity_audience {
+        Some(audience) => validate_aws_web_identity(aws, audience),
+        None => Ok(()),
+    }
+}
+
+fn validate_aws_web_identity(aws: &AwsProviderConfig, audience: &str) -> Result<(), ConfigError> {
+    if audience.is_empty()
+        || audience.len() > 200
+        || !audience.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(ConfigError::invalid(
+            "aws.web_identity_audience",
+            "must be 1-200 non-whitespace printable ASCII characters",
+        ));
+    }
+    let role_in_account = aws.role_arn.as_deref().is_some_and(|arn| {
+        arn.strip_prefix("arn:aws:iam::")
+            .and_then(|rest| rest.strip_prefix(aws.account_id.as_str()))
+            .and_then(|rest| rest.strip_prefix(":role/"))
+            .is_some_and(is_iam_role_path)
+    });
+    if !role_in_account {
+        return Err(ConfigError::invalid(
+            "aws.role_arn",
+            "web identity federation requires an IAM role ARN in aws.account_id",
+        ));
+    }
+    if aws.external_id.is_some() {
+        return Err(ConfigError::invalid(
+            "aws.external_id",
+            "AssumeRoleWithWebIdentity has no ExternalId; pin the audience in the role trust policy instead",
+        ));
+    }
+    Ok(())
+}
+
+/// The part of a role ARN after `:role/`: optional printable path segments
+/// followed by a role name.
+fn is_iam_role_path(path: &str) -> bool {
+    const MAX_PATH_AND_NAME: usize = 512 + 64;
+    let mut segments = path.split('/');
+    path.len() <= MAX_PATH_AND_NAME
+        && segments
+            .next_back()
+            .is_some_and(|name| is_iam_name(name, 1, 64))
+        && segments.all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_graphic()))
+}
+
+fn is_iam_name(value: &str, min: usize, max: usize) -> bool {
+    (min..=max).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b))
 }
 
 fn is_safe_cloud_token(value: &str) -> bool {

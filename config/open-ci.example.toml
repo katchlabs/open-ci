@@ -53,6 +53,10 @@ account_id = "123456789012"
 # Optional cross-account/BYOC STS AssumeRole (resolves base credentials from env or EC2 IMDSv2):
 # role_arn = "arn:aws:iam::123456789012:role/open-ci-controller"
 # external_id = "your-unique-external-id"
+# Or, for a controller running on GCP: keyless federation via the VM's Google identity token
+# (STS AssumeRoleWithWebIdentity; see the multi-cloud Terraform outputs). Do not combine with external_id.
+# role_arn = "arn:aws:iam::123456789012:role/open-ci-gcp-controller"
+# web_identity_audience = "open-ci-aws-federation"
 
 # Optional built-in GitHub Actions v2 transparent cache (`open-ci cache --config ...`).
 # Jobs authenticate with their own ACTIONS_RUNTIME_TOKEN; entries are isolated per repository and Git ref.

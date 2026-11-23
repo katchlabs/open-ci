@@ -1,10 +1,14 @@
 //! Control-plane wiring, HTTP server, background reconciler, and graceful shutdown.
 
 use anyhow::{Context, Result, anyhow};
+use open_ci_core::config::AwsProviderConfig;
 use open_ci_core::{Clock, OpenCiConfig, SecretString, SystemClock};
 use open_ci_github::{FileGitHubToken, GitHubClient, OidcVerifier, StaticGitHubToken};
 use open_ci_provider::ProviderRegistry;
-use open_ci_provider_aws::{AssumeRoleConfig, AwsCredentialChain, AwsProvider};
+use open_ci_provider_aws::{
+    AssumeRoleConfig, AwsCredentialChain, AwsCredentialsSource, AwsProvider,
+    GceWebIdentityCredentials, WebIdentityConfig,
+};
 use open_ci_provider_gcp::{
     FileTokenSource, GcpProvider, GcpTokenSource, ImpersonatedTokenSource, ImpersonationConfig,
     MetadataTokenSource,
@@ -130,22 +134,43 @@ fn build_provider_registry(cfg: &OpenCiConfig, http: &reqwest::Client) -> Result
     }
 
     if let Some(aws_cfg) = cfg.aws.clone() {
-        let assume_role = aws_cfg.role_arn.as_ref().map(|arn| {
-            let session_name = aws_cfg
-                .role_session_name
-                .clone()
-                .unwrap_or_else(|| "open-ci".to_owned());
-            let mut role_cfg = AssumeRoleConfig::new(arn.clone(), session_name);
-            if let Some(ext_id) = &aws_cfg.external_id {
-                role_cfg = role_cfg.with_external_id(ext_id.clone());
-            }
-            role_cfg
-        });
-        let creds = Arc::new(AwsCredentialChain::new(http.clone(), assume_role));
+        let creds = build_aws_credentials(&aws_cfg, http)?;
         registry.register(Arc::new(AwsProvider::new(aws_cfg, http.clone(), creds)));
     }
 
     Ok(registry)
+}
+
+fn build_aws_credentials(
+    aws_cfg: &AwsProviderConfig,
+    http: &reqwest::Client,
+) -> Result<Arc<dyn AwsCredentialsSource>> {
+    let session_name = aws_cfg
+        .role_session_name
+        .clone()
+        .unwrap_or_else(|| "open-ci".to_owned());
+    match (&aws_cfg.web_identity_audience, &aws_cfg.role_arn) {
+        (Some(_), Some(_)) if aws_cfg.external_id.is_some() => Err(anyhow!(
+            "`aws.external_id` cannot be combined with `aws.web_identity_audience`"
+        )),
+        (Some(audience), Some(arn)) => Ok(Arc::new(GceWebIdentityCredentials::new(
+            http.clone(),
+            WebIdentityConfig::new(arn.clone(), session_name, audience.clone()),
+        ))),
+        (Some(_), None) => Err(anyhow!(
+            "`aws.web_identity_audience` requires `aws.role_arn`"
+        )),
+        (None, role_arn) => {
+            let assume_role = role_arn.as_ref().map(|arn| {
+                let role_cfg = AssumeRoleConfig::new(arn.clone(), session_name);
+                match &aws_cfg.external_id {
+                    Some(ext_id) => role_cfg.with_external_id(ext_id.clone()),
+                    None => role_cfg,
+                }
+            });
+            Ok(Arc::new(AwsCredentialChain::new(http.clone(), assume_role)))
+        }
+    }
 }
 
 fn load_runtime_secrets(
@@ -221,5 +246,39 @@ pub(crate) async fn wait_for_shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aws_config(audience: Option<&str>, role_arn: Option<&str>) -> AwsProviderConfig {
+        AwsProviderConfig {
+            account_id: "123456789012".to_owned(),
+            endpoint_url: None,
+            role_arn: role_arn.map(str::to_owned),
+            external_id: None,
+            role_session_name: None,
+            web_identity_audience: audience.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn build_aws_credentials_fails_closed_on_invalid_web_identity_combinations() {
+        let http = reqwest::Client::new();
+        let orphan_audience = aws_config(Some("open-ci-aws-federation"), None);
+        assert!(build_aws_credentials(&orphan_audience, &http).is_err());
+        let federated = aws_config(
+            Some("open-ci-aws-federation"),
+            Some("arn:aws:iam::123456789012:role/open-ci-gcp-controller"),
+        );
+        assert!(build_aws_credentials(&federated, &http).is_ok());
+        assert!(build_aws_credentials(&aws_config(None, None), &http).is_ok());
+        let with_external_id = AwsProviderConfig {
+            external_id: Some("tenant".to_owned()),
+            ..federated
+        };
+        assert!(build_aws_credentials(&with_external_id, &http).is_err());
     }
 }

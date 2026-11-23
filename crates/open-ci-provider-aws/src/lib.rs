@@ -10,7 +10,8 @@ pub mod xml;
 
 pub use credentials::{
     AssumeRoleConfig, AwsCredentialChain, AwsCredentialsSource, EnvAwsCredentials,
-    ImdsAwsCredentials, StaticAwsCredentials, StsAssumeRoleCredentials,
+    GceWebIdentityCredentials, ImdsAwsCredentials, StaticAwsCredentials, StsAssumeRoleCredentials,
+    WebIdentityConfig,
 };
 
 use async_trait::async_trait;
