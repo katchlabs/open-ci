@@ -50,6 +50,18 @@ variable "backup_bucket_arn" {
   default     = ""
 }
 
+variable "create_spot_service_linked_role" {
+  description = "Create the account-wide EC2 Spot service-linked role. Set false if the account already has AWSServiceRoleForEC2Spot."
+  type        = bool
+  default     = true
+}
+
+variable "janitor_max_lifetime_seconds" {
+  description = "Janitor runner lifetime ceiling from launch; must be at least the largest pools.*.lifetime_seconds."
+  type        = number
+  default     = 3600
+}
+
 variable "janitor_zip_path" {
   description = "Optional path to compiled open-ci-aws-janitor Lambda zip."
   type        = string
@@ -65,6 +77,10 @@ module "aws_foundation" {
   aws_region         = var.aws_region
   availability_zones = var.availability_zones
   janitor_zip_path   = var.janitor_zip_path
+
+  janitor_max_lifetime_seconds = var.janitor_max_lifetime_seconds
+
+  create_spot_service_linked_role = var.create_spot_service_linked_role
 }
 
 module "aws_controller" {
@@ -97,4 +113,8 @@ output "runner_subnets" {
 
 output "runner_security_group_id" {
   value = module.aws_foundation.runner_security_group_id
+}
+
+output "ssm_session_command" {
+  value = module.aws_controller.ssm_session_command
 }

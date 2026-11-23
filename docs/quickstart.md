@@ -40,7 +40,13 @@ terraform apply \
 Optional variables:
 - `-var='assume_role_arns=["arn:aws:iam::222222222222:role/open-ci-byoc"]'` for cross-account BYOC runner provisioning.
 - `-var="backup_bucket_arn=arn:aws:s3:::my-open-ci-backups"` for encrypted SQLite state backups.
-- `-var="janitor_zip_path=/path/to/open-ci-aws-janitor.zip"` to deploy the Rust `open-ci-aws-janitor` Lambda (`provided.al2023`).
+- `-var="janitor_zip_path=/path/to/open-ci-aws-janitor-lambda-aarch64-unknown-linux-gnu.zip"` to deploy the Rust `open-ci-aws-janitor` Lambda (`provided.al2023`, arm64). Download the zip from the release (it contains the required `bootstrap` executable); do not pass the `.tar.gz`.
+- `-var="create_spot_service_linked_role=false"` if the account already has `AWSServiceRoleForEC2Spot`. EC2 only launches Spot through the API once that role exists, so leave it `true` in a fresh account.
+
+AWS Spot notes:
+- **One janitor per region.** The janitor sweeps only the region it is deployed in. Apply `aws-foundation` (with `janitor_zip_path`) in every region that has AWS placements. IAM names and the Spot service-linked role are account-wide, so each additional region needs a distinct `name_prefix` and `create_spot_service_linked_role = false`.
+- **Janitor ceiling.** `janitor_max_lifetime_seconds` (default `3600`) must be at least the largest `pools.*.lifetime_seconds`; the janitor terminates any runner older than this from launch.
+- **Controller access.** The controller runs Ubuntu 24.04 with the SSM agent and no inbound SSH. Open a shell with `$(terraform output -raw ssm_session_command)` (requires the AWS CLI Session Manager plugin).
 
 ### Path B: GCP-Only (`gcp-quickstart`)
 
@@ -66,6 +72,8 @@ terraform apply \
   -var="aws_region=us-east-1" \
   -var="domain=ci.example.com"
 ```
+
+The multi-cloud example's GCP controller reaches AWS without access keys: it exchanges its Google identity token for the `aws_role_arn` output via STS `AssumeRoleWithWebIdentity`. Copy the `aws_role_arn` and `aws_web_identity_audience` outputs into `[aws]` in Step 3.
 
 After `terraform apply` completes, create a DNS `A` record pointing `ci.example.com` to the `controller_ip` output and note the printed subnet IDs, security group ID, and IAM/service account outputs.
 
@@ -124,7 +132,7 @@ packer build \
 
 ## Step 3: Configure `open-ci.toml`, Secrets & Credential Broker
 
-On the controller host, install the binary to `/usr/local/bin/open-ci` and create dedicated system users (`open-ci` for the control plane and cache; `open-ci-broker` in group `open-ci` for credential rotation):
+On the controller host (AWS: connect with `$(terraform output -raw ssm_session_command)`), install the binary to `/usr/local/bin/open-ci` and create dedicated system users (`open-ci` for the control plane and cache; `open-ci-broker` in group `open-ci` for credential rotation):
 
 ```bash
 sudo useradd --system --home-dir /var/lib/open-ci --shell /usr/sbin/nologin open-ci
@@ -180,6 +188,7 @@ Start from [`config/open-ci.example.toml`](../config/open-ci.example.toml). Key 
   - `admission.mode = "hybrid"` — Accepts both simultaneously.
 - **BYOC Cross-Account / Cross-Project Identity (optional):**
   - AWS: set `aws.role_arn = "arn:aws:iam::222222222222:role/open-ci-controller"` and `aws.external_id = "your-unique-external-id"`.
+  - AWS from a GCP-hosted controller (multi-cloud): set `aws.role_arn` and `aws.web_identity_audience` from the Terraform outputs. No AWS access keys are stored; `external_id` is not used with web identity.
   - GCP: set `gcp.impersonate_service_account = "open-ci-runner-mgr@customer-project.iam.gserviceaccount.com"`.
 - **Transparent Actions v2 Cache (optional):**
   ```toml

@@ -27,14 +27,16 @@ data "aws_caller_identity" "current" {}
 
 data "aws_region" "current" {}
 
-data "aws_ami" "debian" {
+data "aws_partition" "current" {}
+
+data "aws_ami" "ubuntu" {
   count       = var.ami_id == "" ? 1 : 0
   most_recent = true
-  owners      = ["136693071363"]
+  owners      = ["099720109477"]
 
   filter {
     name   = "name"
-    values = ["debian-12-${var.architecture == "arm64" ? "arm64" : "amd64"}-*"]
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-${var.architecture == "arm64" ? "arm64" : "amd64"}-server-*"]
   }
 
   filter {
@@ -76,6 +78,12 @@ resource "aws_iam_instance_profile" "controller" {
   name = "${var.name_prefix}-controller"
   role = aws_iam_role.controller.name
   tags = local.common_tags
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_session_manager" {
+  count      = var.enable_ssm ? 1 : 0
+  role       = aws_iam_role.controller.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_role_policy_attachment" "external_controller_policy" {
@@ -261,7 +269,7 @@ resource "aws_security_group" "controller" {
 }
 
 resource "aws_instance" "controller" {
-  ami                         = var.ami_id != "" ? var.ami_id : data.aws_ami.debian[0].id
+  ami                         = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu[0].id
   instance_type               = var.instance_type
   subnet_id                   = var.subnet_id
   vpc_security_group_ids      = [aws_security_group.controller.id]

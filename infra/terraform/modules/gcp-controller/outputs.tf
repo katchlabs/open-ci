@@ -8,6 +8,11 @@ output "controller_service_account_email" {
   value       = google_service_account.controller.email
 }
 
+output "controller_service_account_unique_id" {
+  description = "Numeric unique ID of the controller service account (the sub/azp claim of its identity tokens)."
+  value       = google_service_account.controller.unique_id
+}
+
 output "secret_ids" {
   description = "Secret Manager secret IDs to populate with open-ci runtime secrets."
   value       = { for k, v in google_secret_manager_secret.controller : k => v.secret_id }

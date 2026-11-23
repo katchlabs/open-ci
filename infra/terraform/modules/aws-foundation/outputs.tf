@@ -22,3 +22,13 @@ output "janitor_lambda_arn" {
   description = "ARN of the deployed Rust AWS expiry janitor Lambda (empty if janitor_zip_path unset)."
   value       = length(aws_lambda_function.janitor) > 0 ? aws_lambda_function.janitor[0].arn : ""
 }
+
+output "gcp_controller_role_arn" {
+  description = "IAM role ARN for aws.role_arn on a GCP-hosted controller (empty unless federate_gcp_controller is true)."
+  value       = length(aws_iam_role.gcp_controller) > 0 ? aws_iam_role.gcp_controller[0].arn : ""
+}
+
+output "web_identity_audience" {
+  description = "Value for aws.web_identity_audience in open-ci.toml (empty unless federate_gcp_controller is true)."
+  value       = var.federate_gcp_controller ? var.web_identity_audience : ""
+}
