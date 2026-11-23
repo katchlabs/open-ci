@@ -13,7 +13,8 @@ use open_ci_core::models::{
     ProviderKind, Worker, WorkerPhase,
 };
 use open_ci_core::reconcile::{
-    RetireReason, evaluate_retirement, plan_scale_up, select_placement, transition_phase,
+    LAUNCH_VISIBILITY_GRACE_SECONDS, RetireReason, evaluate_retirement, missing_instance_is_lost,
+    plan_scale_up, select_placement, transition_phase,
 };
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -565,4 +566,49 @@ fn workers_get_the_cache_url_only_when_their_pool_opts_in() -> Result<(), Box<dy
         "transparent_cache requires a [cache] section"
     );
     Ok(())
+}
+
+fn live_worker(created_at: u64, bootstrap_used: bool) -> Worker {
+    Worker {
+        name: "open-ci-api-1".to_owned(),
+        pool_id: "api".to_owned(),
+        admission_id: None,
+        request_id: "req-1".to_owned(),
+        provider: ProviderKind::Aws,
+        placement_index: 0,
+        region: "us-east-1".to_owned(),
+        zone: "us-east-1a".to_owned(),
+        machine_type: "c7g.xlarge".to_owned(),
+        provider_instance_id: Some("i-0abc".to_owned()),
+        phase: WorkerPhase::Live,
+        create_operation: None,
+        delete_operation: None,
+        delete_attempts: 0,
+        bootstrap_used,
+        runner_id: None,
+        job_id: None,
+        retire_reason: None,
+        created_at,
+        updated_at: created_at,
+    }
+}
+
+#[test]
+fn unlisted_launch_is_lost_only_after_visibility_grace() {
+    let created = 10_000;
+    let launching = live_worker(created, false);
+    let grace_ends = created + LAUNCH_VISIBILITY_GRACE_SECONDS;
+    assert!(!missing_instance_is_lost(&launching, created - 5));
+    assert!(!missing_instance_is_lost(&launching, created));
+    assert!(!missing_instance_is_lost(&launching, grace_ends - 1));
+    assert!(missing_instance_is_lost(&launching, grace_ends));
+}
+
+#[test]
+fn unlisted_bootstrapped_worker_is_lost_immediately() {
+    let created = 10_000;
+    assert!(missing_instance_is_lost(
+        &live_worker(created, true),
+        created
+    ));
 }

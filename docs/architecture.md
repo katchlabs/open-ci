@@ -176,10 +176,12 @@ stateDiagram-v2
     Planned --> Retiring : "Create failed"
     Creating --> Live : "Operation DONE"
     Creating --> Retiring : "Create op failed / timeout"
-    Live --> Retiring : "Job completed / idle expired / lifetime expired / draining idle"
+    Live --> Retiring : "Job completed / idle expired / lifetime expired / draining idle / instance lost"
     Retiring --> Gone : "Cloud VM deleted or confirmed absent"
     Gone --> [*]
 ```
+
+EC2 is eventually consistent: `DescribeInstances` can report `InvalidInstanceID.NotFound` for an instance `RunInstances` just created. A `Live` worker the provider cannot list (on AWS this includes `terminated` instances, which `get_instance` filters out) is treated as lost immediately once it has bootstrapped, and otherwise only after `LAUNCH_VISIBILITY_GRACE_SECONDS` (90s) from creation. A listed instance that is `stopping`/`shutting-down` retires immediately.
 
 ---
 

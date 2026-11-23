@@ -9,13 +9,16 @@ use open_ci_core::config::{
     AdmissionConfig, GitHubConfig, Guardrails, OidcTrustConfig, OpenCiConfig, Placement,
     PoolConfig, ServerConfig,
 };
+use open_ci_core::reconcile::LAUNCH_VISIBILITY_GRACE_SECONDS;
 use open_ci_core::{
     AdmissionMode, AdmissionRequest, AdmissionStatus, Architecture, Capacity, Clock, ControlMode,
-    ManualClock, ProviderKind, SecretString, WorkerPhase,
+    ManualClock, ProviderKind, SecretString, Worker, WorkerPhase,
 };
 use open_ci_github::webhook::sign_webhook_body;
 use open_ci_github::{GitHubClient, OidcVerifier, StaticGitHubToken};
-use open_ci_provider::{CloudDisk, CloudInstance, InstanceStatus, ProviderError, ProviderRegistry};
+use open_ci_provider::{
+    CloudDisk, CloudInstance, CloudProvider, InstanceStatus, ProviderError, ProviderRegistry,
+};
 use open_ci_provider_mock::MockProvider;
 use open_ci_server::bootstrap::mint_bootstrap_token;
 use open_ci_server::http::build_router;
@@ -398,6 +401,138 @@ async fn full_lifecycle_webhook_bootstrap_completion_and_orphan_cleanup() {
         .unwrap_or_default();
     assert_eq!(backoffs.len(), 1);
     assert_eq!(backoffs[0].region, "us-west1");
+}
+
+const QUEUED_JOB_WEBHOOK: &[u8] = br#"{"action":"queued","repository":{"full_name":"acme/app"},"workflow_job":{"id":501,"run_id":77,"labels":["self-hosted","open-ci-api"]}}"#;
+
+/// Launches one queued job on a provider that behaves like EC2: launches
+/// complete synchronously and stay unlisted for `hidden_reads` lookups.
+async fn ec2_like_launch(hidden_reads: usize) -> Option<(E2eHarness, Worker)> {
+    let gh_state = Arc::new(Mutex::new(FakeGitHubState {
+        job_status: "queued".to_owned(),
+        ..FakeGitHubState::default()
+    }));
+    let harness = setup_e2e_harness(start_fake_github(gh_state).await).await?;
+    harness.mock.set_sync_launches(true).await;
+    harness
+        .mock
+        .hide_new_instances_for_reads(hidden_reads)
+        .await;
+    let app = build_router(harness.cp.clone());
+    let delivered =
+        send_signed_webhook(&app, &harness.secrets.webhook_secret, QUEUED_JOB_WEBHOOK).await;
+    assert_eq!(delivered, Some(StatusCode::ACCEPTED));
+    let summary = harness.cp.reconcile_once().await;
+    assert!(matches!(&summary, Ok(s) if s.workers_created == 1));
+    let worker = harness
+        .store
+        .list_workers(Some("api"))
+        .await
+        .ok()?
+        .into_iter()
+        .find(|w| w.name != "open-ci-api-orphan")?;
+    Some((harness, worker))
+}
+
+async fn tick(harness: &E2eHarness, seconds: u64) {
+    harness.clock.advance(seconds);
+    assert!(harness.cp.reconcile_once().await.is_ok());
+}
+
+async fn current(harness: &E2eHarness, worker: &Worker) -> Option<Worker> {
+    harness
+        .store
+        .list_workers(Some("api"))
+        .await
+        .ok()?
+        .into_iter()
+        .find(|w| w.name == worker.name)
+}
+
+async fn bootstrap_worker(harness: &E2eHarness, worker: &Worker) {
+    let token = mint_bootstrap_token(&harness.secrets.bootstrap_secret, &worker.name);
+    assert!(token.is_ok());
+    if let Ok(token) = token {
+        let bootstrapped = harness.cp.handle_bootstrap(&worker.name, &token).await;
+        assert!(bootstrapped.is_ok());
+    }
+}
+
+fn retired_as_lost(worker: Option<&Worker>) -> bool {
+    worker.is_some_and(|w| {
+        w.phase == WorkerPhase::Retiring
+            && w.retire_reason.as_deref() == Some("instance_terminated")
+    })
+}
+
+#[tokio::test]
+async fn eventually_consistent_launch_stays_live_until_listed() {
+    let launched = ec2_like_launch(2).await;
+    assert!(launched.is_some());
+    let Some((harness, worker)) = launched else {
+        return;
+    };
+    for _ in 0..2 {
+        tick(&harness, 5).await;
+        let observed = current(&harness, &worker).await;
+        assert!(
+            observed
+                .as_ref()
+                .is_some_and(|w| w.phase == WorkerPhase::Live),
+            "an instance the cloud API cannot list yet must stay Live: {observed:?}"
+        );
+    }
+    bootstrap_worker(&harness, &worker).await;
+    tick(&harness, 5).await;
+    let listed = current(&harness, &worker).await;
+    assert!(
+        listed.is_some_and(|w| w.phase == WorkerPhase::Live),
+        "once bootstrapped, the worker stays Live only because the instance is now listed"
+    );
+}
+
+#[tokio::test]
+async fn unlisted_launch_retires_after_visibility_grace() {
+    let launched = ec2_like_launch(usize::MAX).await;
+    assert!(launched.is_some());
+    let Some((harness, worker)) = launched else {
+        return;
+    };
+    tick(&harness, LAUNCH_VISIBILITY_GRACE_SECONDS - 1).await;
+    let before = current(&harness, &worker).await;
+    assert!(before.is_some_and(|w| w.phase == WorkerPhase::Live));
+    tick(&harness, 1).await;
+    assert!(retired_as_lost(current(&harness, &worker).await.as_ref()));
+}
+
+#[tokio::test]
+async fn bootstrapped_worker_retires_at_once_when_its_instance_disappears() {
+    let launched = ec2_like_launch(0).await;
+    assert!(launched.is_some());
+    let Some((harness, worker)) = launched else {
+        return;
+    };
+    bootstrap_worker(&harness, &worker).await;
+    let placement = mock_placement("us-west1", "us-west1-a", "n2d-standard-2", "subnet-a");
+    let deleted = harness
+        .mock
+        .delete_instance(&placement, &worker.name, None)
+        .await;
+    assert!(deleted.is_ok());
+    tick(&harness, 5).await;
+    assert!(retired_as_lost(current(&harness, &worker).await.as_ref()));
+}
+
+#[tokio::test]
+async fn preempted_instance_retires_inside_visibility_grace() {
+    let launched = ec2_like_launch(0).await;
+    assert!(launched.is_some());
+    let Some((harness, worker)) = launched else {
+        return;
+    };
+    harness.mock.preempt_instance(&worker.name).await;
+    tick(&harness, 5).await;
+    assert!(retired_as_lost(current(&harness, &worker).await.as_ref()));
 }
 
 struct FakeJobRecord {

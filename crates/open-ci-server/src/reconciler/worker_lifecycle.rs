@@ -3,7 +3,9 @@
 use super::ReconcileSummary;
 use crate::{ControlPlane, ServerError};
 use open_ci_core::config::{Placement, PoolConfig};
-use open_ci_core::reconcile::{RetireReason, evaluate_retirement, transition_phase};
+use open_ci_core::reconcile::{
+    RetireReason, evaluate_retirement, missing_instance_is_lost, transition_phase,
+};
 use open_ci_core::{ControlEvent, ControlMode, Job, Worker, WorkerPhase};
 use open_ci_provider::{CloudProvider, InstanceStatus, OperationRef, OperationStatus};
 
@@ -147,12 +149,15 @@ impl ControlPlane {
                 worker.provider_instance_id.as_deref(),
             )
             .await?;
-        let preempted = cloud_inst.as_ref().is_none_or(|i| {
-            matches!(
-                i.status,
-                InstanceStatus::Terminated | InstanceStatus::Stopping
-            )
-        });
+        let preempted = cloud_inst.as_ref().map_or_else(
+            || missing_instance_is_lost(worker, ctx.now),
+            |i| {
+                matches!(
+                    i.status,
+                    InstanceStatus::Terminated | InstanceStatus::Stopping
+                )
+            },
+        );
 
         let reason = if preempted {
             Some(RetireReason::InstanceTerminated)
