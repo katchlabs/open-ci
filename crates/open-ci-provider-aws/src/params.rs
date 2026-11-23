@@ -39,9 +39,11 @@ pub(crate) fn classify_aws_error(
 ) -> ProviderError {
     let code = xml::parse_error_code(xml_body).unwrap_or_default();
     match code.as_str() {
-        "InsufficientInstanceCapacity" => ProviderError::CapacityUnavailable {
-            zone: placement.map_or_else(String::new, |p| p.zone.clone()),
-        },
+        "InsufficientInstanceCapacity" | "SpotMaxPriceTooLow" | "Unsupported" => {
+            ProviderError::CapacityUnavailable {
+                zone: placement.map_or_else(String::new, |p| p.zone.clone()),
+            }
+        }
         "MaxSpotInstanceCountExceeded" | "VcpuLimitExceeded" | "InstanceLimitExceeded" => {
             ProviderError::QuotaExceeded {
                 region: region.to_owned(),
@@ -51,10 +53,10 @@ pub(crate) fn classify_aws_error(
         "RequestLimitExceeded" | "Throttling" => ProviderError::RateLimited {
             retry_after_seconds: 30,
         },
-        "UnauthorizedOperation"
-        | "AuthFailure"
-        | "InvalidClientTokenId"
-        | "SignatureDoesNotMatch" => ProviderError::AuthFailed,
+        "UnauthorizedOperation" | "InvalidClientTokenId" | "SignatureDoesNotMatch" => {
+            ProviderError::AuthFailed
+        }
+        c if c == "AuthFailure" || c.starts_with("AuthFailure.") => ProviderError::AuthFailed,
         "InvalidInstanceID.NotFound" | "InvalidVolume.NotFound" => ProviderError::NotFound,
         "InvalidAMIID.NotFound" | "InvalidSubnetID.NotFound" => ProviderError::InvalidConfig(code),
         _ if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN => {

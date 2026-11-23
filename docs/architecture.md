@@ -161,7 +161,7 @@ Each pool defines one or more `[[pools.<id>.placements]]` across GCP and/or AWS 
 
 When a cloud launch fails, provider errors are classified deterministically:
 - `ProviderError::QuotaExceeded` → 300-second regional `(provider, region, family)` backoff.
-- `ProviderError::CapacityUnavailable` (Spot stockout / `InsufficientInstanceCapacity` / `ZONE_RESOURCE_POOL_EXHAUSTED`) → 90-second backoff.
+- `ProviderError::CapacityUnavailable` (Spot stockout / `InsufficientInstanceCapacity` / `SpotMaxPriceTooLow` / `Unsupported` instance type in the AZ / `ZONE_RESOURCE_POOL_EXHAUSTED`) → 90-second backoff.
 - `ProviderError::RateLimited` → `retry_after_seconds` backoff (default 30s).
 
 The next reconciler tick immediately spills demand onto healthy regions, families, or the secondary cloud.
