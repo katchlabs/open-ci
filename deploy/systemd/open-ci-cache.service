@@ -1,0 +1,37 @@
+[Unit]
+Description=open-ci Transparent Actions Cache Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=open-ci
+Group=open-ci
+EnvironmentFile=-/etc/open-ci/cache.env
+ExecStart=/usr/local/bin/open-ci cache --config /etc/open-ci/open-ci.toml
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+# Systemd sandboxing & hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths=/var/lib/open-ci-cache
+ReadOnlyPaths=/etc/open-ci /run/open-ci
+StateDirectory=open-ci-cache
+RuntimeDirectory=open-ci-cache
+RuntimeDirectoryPreserve=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+[package]
+name = "open-ci-provider-aws"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+open-ci-core = { workspace = true }
+open-ci-provider = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+quick-xml = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

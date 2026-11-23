@@ -1,0 +1,13 @@
+{
+  "name": "@open-ci/route-action",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OIDC-authenticated admission client for open-ci ephemeral GitHub Actions runners",
+  "scripts": {
+    "test": "node --test test/route.test.ts"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

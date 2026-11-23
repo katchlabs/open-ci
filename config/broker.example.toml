@@ -1,0 +1,12 @@
+# Privilege-separated credential broker configuration.
+# Run via open-ci-credentials.timer as User=open-ci-broker (Group=open-ci);
+# open-ci itself only reads rotated 0640 tokens from /run/open-ci.
+
+app_id = 123456
+installation_id = 78901234
+private_key_path = "/etc/open-ci/github-app.pem"
+github_api_url = "https://api.github.com"
+github_token_output = "/run/open-ci/github-token"
+gcp_metadata_url = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
+gcp_token_output = "/run/open-ci/gcp-token"
+health_output = "/run/open-ci/credentials-health.json"

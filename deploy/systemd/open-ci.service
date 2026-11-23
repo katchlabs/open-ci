@@ -1,0 +1,36 @@
+[Unit]
+Description=open-ci Control Plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=open-ci
+Group=open-ci
+ExecStartPre=/usr/local/bin/open-ci validate --config /etc/open-ci/open-ci.toml
+ExecStart=/usr/local/bin/open-ci serve --config /etc/open-ci/open-ci.toml
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+
+# Systemd sandboxing & hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths=/var/lib/open-ci
+ReadOnlyPaths=/etc/open-ci /run/open-ci
+StateDirectory=open-ci
+RuntimeDirectory=open-ci
+RuntimeDirectoryPreserve=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

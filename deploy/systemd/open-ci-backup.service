@@ -1,0 +1,15 @@
+[Unit]
+Description=open-ci Consistent Online SQLite Backup
+
+[Service]
+Type=oneshot
+User=open-ci
+Group=open-ci
+ExecStart=/usr/local/bin/open-ci backup --config /etc/open-ci/open-ci.toml --output /var/backups/open-ci/state.db
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/backups/open-ci
+ReadOnlyPaths=/etc/open-ci /var/lib/open-ci
+UMask=0077

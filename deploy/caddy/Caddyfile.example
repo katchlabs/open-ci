@@ -1,0 +1,20 @@
+# Reverse proxy template for open-ci.
+# Public ingress exposes ONLY liveness/readiness checks, GitHub webhooks,
+# OIDC admission, and worker bootstrap/usage endpoints.
+# Operator API (/api/v1/*) and Prometheus metrics (/metrics) are blocked on
+# the public listener and should be accessed via loopback, SSH tunnel, or a
+# private VPN (e.g., Tailscale/WireGuard).
+
+ci.example.com {
+	@public_ingress {
+		path /healthz /readyz /v1/ingress/webhook /v1/ingress/admit /v1/workers/*/bootstrap /v1/workers/*/usage
+	}
+
+	handle @public_ingress {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}

@@ -1,0 +1,83 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/open-ci-core",
+    "crates/open-ci-store",
+    "crates/open-ci-provider",
+    "crates/open-ci-provider-gcp",
+    "crates/open-ci-provider-aws",
+    "crates/open-ci-provider-mock",
+    "crates/open-ci-github",
+    "crates/open-ci-server",
+    "crates/open-ci-cache",
+    "crates/open-ci-aws-janitor",
+    "crates/open-ci-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/katchlabs/open-ci"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Allow stylistic pedantic lints that add noise without safety benefit.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+
+[workspace.dependencies]
+open-ci-core = { path = "crates/open-ci-core" }
+open-ci-store = { path = "crates/open-ci-store" }
+open-ci-provider = { path = "crates/open-ci-provider" }
+open-ci-provider-gcp = { path = "crates/open-ci-provider-gcp" }
+open-ci-provider-aws = { path = "crates/open-ci-provider-aws" }
+open-ci-provider-mock = { path = "crates/open-ci-provider-mock" }
+open-ci-github = { path = "crates/open-ci-github" }
+open-ci-server = { path = "crates/open-ci-server" }
+open-ci-cache = { path = "crates/open-ci-cache" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8.9"
+base64 = "0.23.1"
+bytes = "1"
+clap = { version = "4.6", features = ["derive", "env"] }
+fs2 = "0.4"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+hex = "0.4"
+hmac = "0.12"
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto", "use_pem"] }
+proptest = "1"
+quick-xml = "0.37"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "process", "io-util", "fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.9"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+uuid = { version = "1", features = ["v4"] }

@@ -1,0 +1,33 @@
+name: Open CI Route
+description: Request OIDC-authenticated self-hosted runner capacity from an open-ci control plane with fail-closed fallback.
+inputs:
+  endpoint:
+    description: Full HTTPS URL of the open-ci admission endpoint (e.g. https://ci.example.com/v1/ingress/admit)
+    required: true
+  audience:
+    description: Expected OIDC JWT audience configured on the open-ci control plane
+    required: true
+  pools:
+    description: JSON array of requested pool IDs (e.g. ["default", "arm64"])
+    required: true
+  fallbacks:
+    description: JSON object mapping every pool ID to its fallback GitHub Actions runner label
+    required: true
+  fallback-on-rerun:
+    description: Set to 'false' to allow workflow reruns (run_attempt > 1) to request open-ci capacity
+    required: false
+    default: "true"
+outputs:
+  admitted:
+    description: "'true' when open-ci admitted the run, 'false' when routed to fallback runners"
+  target:
+    description: "'open-ci' or 'fallback'"
+  reason:
+    description: Machine-readable admission reason
+  reservation:
+    description: Scoped reservation identifier (empty string when routed to fallback)
+  runners:
+    description: JSON object mapping each pool ID to the runner label to assign
+runs:
+  using: node24
+  main: src/index.ts
