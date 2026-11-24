@@ -25,7 +25,6 @@ pub struct ServerSecrets {
     pub webhook_secret: SecretString,
     pub bootstrap_secret: SecretString,
     pub operator_token: Option<SecretString>,
-    pub cache_signing_key: Option<SecretString>,
 }
 
 impl ServerSecrets {
@@ -40,13 +39,6 @@ impl ServerSecrets {
         {
             return Err(ServerError::InvalidConfig(
                 "operator_token must be at least 24 bytes when set".to_owned(),
-            ));
-        }
-        if let Some(key) = &self.cache_signing_key
-            && key.len() < 32
-        {
-            return Err(ServerError::InvalidConfig(
-                "cache_signing_key must be at least 32 bytes when set".to_owned(),
             ));
         }
         Ok(())

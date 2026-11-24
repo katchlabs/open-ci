@@ -24,6 +24,12 @@ pub enum CacheError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+
+    #[error("length required: {0}")]
+    LengthRequired(String),
+
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
 
@@ -35,6 +41,15 @@ pub enum CacheError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("upstream unavailable: {0}")]
+    BadGateway(String),
+}
+
+impl From<rusqlite::Error> for CacheError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Storage(format!("cache index: {err}"))
+    }
 }
 
 #[derive(Serialize)]
@@ -52,9 +67,12 @@ impl CacheError {
             Self::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthenticated"),
             Self::Forbidden(_) => (StatusCode::FORBIDDEN, "permission_denied"),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
+            Self::AlreadyExists(_) => (StatusCode::CONFLICT, "already_exists"),
+            Self::LengthRequired(_) => (StatusCode::LENGTH_REQUIRED, "invalid_argument"),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "resource_exhausted"),
             Self::RangeNotSatisfiable(_) => (StatusCode::RANGE_NOT_SATISFIABLE, "out_of_range"),
             Self::Storage(_) | Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, "unavailable"),
         }
     }
 }
@@ -62,10 +80,13 @@ impl CacheError {
 impl IntoResponse for CacheError {
     fn into_response(self) -> Response {
         let (status, code) = self.status_and_code();
-        let body = ErrorBody {
-            code,
-            msg: self.to_string(),
+        let msg = if status.is_server_error() {
+            tracing::error!(error = %self, "cache request failed");
+            "cache service error".to_owned()
+        } else {
+            self.to_string()
         };
+        let body = ErrorBody { code, msg };
         (status, Json(body)).into_response()
     }
 }

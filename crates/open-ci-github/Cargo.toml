@@ -8,7 +8,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-support = ["dep:axum"]
+
 [dependencies]
+axum = { workspace = true, optional = true }
 open-ci-core = { workspace = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
@@ -24,3 +28,4 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+open-ci-github = { path = ".", features = ["test-support"] }

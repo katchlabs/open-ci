@@ -27,8 +27,6 @@ struct AgentEnvelope {
     lifetime_seconds: u64,
     #[serde(default)]
     cache_url: Option<String>,
-    #[serde(default)]
-    cache_token: Option<String>,
 }
 
 /// Reads the JSON bootstrap envelope from stdin, fetches a one-time JIT config,
@@ -63,8 +61,16 @@ async fn execute_runner_lifecycle(
     let jit_config = fetch_jit_config(client, env).await?;
     let run_script = runner_dir.join("run.sh");
     let timeout = Duration::from_secs(env.lifetime_seconds);
+    let fallback_cache_url = std::env::var("OPEN_CI_CACHE_URL").ok();
+    let cache_url = configured_cache_url(env, fallback_cache_url.as_deref())
+        .filter(|_| redirect_runner_to_cache(runner_dir));
 
-    let mut cmd = build_runner_command(&run_script, runner_dir, jit_config.trim(), env);
+    let mut cmd = build_runner_command(
+        &run_script,
+        runner_dir,
+        jit_config.trim(),
+        cache_url.as_deref(),
+    );
     let mut child = cmd
         .kill_on_drop(true)
         .spawn()
@@ -134,15 +140,10 @@ fn build_runner_command(
     run_script: &Path,
     runner_dir: &Path,
     jit_config: &str,
-    envelope: &AgentEnvelope,
+    cache_url: Option<&str>,
 ) -> Command {
-    let env_cache_url = std::env::var("OPEN_CI_CACHE_URL").ok();
-    let injected_env = resolve_runner_env(
-        envelope,
-        env_cache_url.as_deref(),
-        Path::new(NVME_WORK_DIR),
-        Path::new(NVME_TMP_DIR),
-    );
+    let injected_env =
+        resolve_runner_env(cache_url, Path::new(NVME_WORK_DIR), Path::new(NVME_TMP_DIR));
 
     let mut cmd = if is_running_as_root() {
         let runner_user =
@@ -166,11 +167,34 @@ fn build_runner_command(
     cmd
 }
 
-/// Computes performance, transparent Actions Cache v2, and local `NVMe` scratch environment
-/// variables injected into the GitHub Actions runner process.
+/// The cache base URL from the envelope, else `OPEN_CI_CACHE_URL`, with the trailing slash
+/// GitHub's own `ACTIONS_RESULTS_URL` carries.
+fn configured_cache_url(envelope: &AgentEnvelope, fallback: Option<&str>) -> Option<String> {
+    let url = [envelope.cache_url.as_deref(), fallback]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|url| !url.is_empty())?;
+    Some(format!("{}/", url.trim_end_matches('/')))
+}
+
+/// Applies the runner redirect; on any failure jobs keep GitHub's cache rather than breaking.
+fn redirect_runner_to_cache(runner_dir: &Path) -> bool {
+    match crate::runner_redirect::apply(&crate::runner_redirect::worker_assembly(runner_dir)) {
+        Ok(outcome) => {
+            tracing::info!(?outcome, "runner results URL redirected to open-ci cache");
+            true
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "runner redirect unavailable; jobs keep GitHub's cache");
+            false
+        }
+    }
+}
+
+/// Performance, Actions Cache v2, and local `NVMe` scratch variables for the runner process.
 fn resolve_runner_env(
-    envelope: &AgentEnvelope,
-    fallback_cache_url: Option<&str>,
+    cache_url: Option<&str>,
     nvme_work_dir: &Path,
     nvme_tmp_dir: &Path,
 ) -> Vec<(&'static str, String)> {
@@ -178,25 +202,9 @@ fn resolve_runner_env(
         ("DOCKER_BUILDKIT", "1".to_owned()),
         ("COMPOSE_DOCKER_CLI_BUILD", "1".to_owned()),
     ];
-
-    let effective_cache_url = envelope
-        .cache_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| fallback_cache_url.map(str::trim).filter(|s| !s.is_empty()));
-
-    if let Some(cache_url) = effective_cache_url {
+    if let Some(cache_url) = cache_url {
         vars.push(("ACTIONS_CACHE_SERVICE_V2", "true".to_owned()));
         vars.push(("ACTIONS_RESULTS_URL", cache_url.to_owned()));
-        if let Some(cache_token) = envelope
-            .cache_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            vars.push(("OPEN_CI_CACHE_TOKEN", cache_token.to_owned()));
-        }
     }
 
     if is_writable_dir(nvme_work_dir) {
@@ -288,7 +296,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn sample_envelope(cache_url: Option<&str>, cache_token: Option<&str>) -> AgentEnvelope {
+    fn sample_envelope(cache_url: Option<&str>) -> AgentEnvelope {
         AgentEnvelope {
             public_url: "https://ci.example.com".to_owned(),
             worker_name: "w-1".to_owned(),
@@ -296,109 +304,70 @@ mod tests {
             usage_token: "usage-tok".to_owned(),
             lifetime_seconds: 1800,
             cache_url: cache_url.map(str::to_owned),
-            cache_token: cache_token.map(str::to_owned),
         }
     }
 
     #[test]
-    fn envelope_deserializes_with_and_without_cache_fields() -> Result<()> {
-        let legacy = r#"{
-            "public_url": "https://ci.example.com",
-            "worker_name": "w-1",
-            "bootstrap_token": "b",
-            "usage_token": "u",
-            "lifetime_seconds": 900
-        }"#;
-        let parsed_legacy: AgentEnvelope = serde_json::from_str(legacy)?;
-        assert!(parsed_legacy.cache_url.is_none());
-        assert!(parsed_legacy.cache_token.is_none());
-
-        let with_cache = r#"{
-            "public_url": "https://ci.example.com",
-            "worker_name": "w-2",
-            "bootstrap_token": "b",
-            "usage_token": "u",
-            "lifetime_seconds": 900,
-            "cache_url": "http://10.0.0.5:8090",
-            "cache_token": "scoped-token-xyz"
-        }"#;
-        let parsed_cache: AgentEnvelope = serde_json::from_str(with_cache)?;
-        assert_eq!(
-            parsed_cache.cache_url.as_deref(),
-            Some("http://10.0.0.5:8090")
-        );
-        assert_eq!(
-            parsed_cache.cache_token.as_deref(),
-            Some("scoped-token-xyz")
-        );
+    fn envelope_tolerates_missing_cache_url_and_legacy_cache_token() -> Result<()> {
+        let without_cache: AgentEnvelope = serde_json::from_str(
+            r#"{"public_url":"https://ci.example.com","worker_name":"w-1","bootstrap_token":"b","usage_token":"u","lifetime_seconds":900}"#,
+        )?;
+        assert!(without_cache.cache_url.is_none());
+        let legacy: AgentEnvelope = serde_json::from_str(
+            r#"{"public_url":"https://ci.example.com","worker_name":"w-2","bootstrap_token":"b","usage_token":"u","lifetime_seconds":900,"cache_url":"http://10.0.0.5:8090","cache_token":"ignored"}"#,
+        )?;
+        assert_eq!(legacy.cache_url.as_deref(), Some("http://10.0.0.5:8090"));
         Ok(())
     }
 
     #[test]
-    fn resolve_env_always_enables_buildkit_and_injects_cache_from_envelope_or_fallback() {
+    fn cache_url_prefers_envelope_then_fallback_and_normalizes_trailing_slash() {
+        assert_eq!(
+            configured_cache_url(
+                &sample_envelope(Some("http://10.0.0.9:8090")),
+                Some("http://x")
+            ),
+            Some("http://10.0.0.9:8090/".to_owned())
+        );
+        assert_eq!(
+            configured_cache_url(&sample_envelope(Some("  ")), Some("http://10.0.0.2:8090/")),
+            Some("http://10.0.0.2:8090/".to_owned())
+        );
+        assert_eq!(configured_cache_url(&sample_envelope(None), None), None);
+    }
+
+    #[test]
+    fn resolve_env_always_enables_buildkit_and_injects_cache_only_when_redirected() {
         let missing = Path::new("/nonexistent/open-ci-nvme-work");
         let missing_tmp = Path::new("/nonexistent/open-ci-nvme-tmp");
 
-        // No cache configured
-        let env_none: HashMap<_, _> =
-            resolve_runner_env(&sample_envelope(None, None), None, missing, missing_tmp)
+        let without: HashMap<_, _> = resolve_runner_env(None, missing, missing_tmp)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            without.get("DOCKER_BUILDKIT").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            without.get("COMPOSE_DOCKER_CLI_BUILD").map(String::as_str),
+            Some("1")
+        );
+        assert!(!without.contains_key("ACTIONS_RESULTS_URL"));
+        assert!(!without.contains_key("RUNNER_WORKDIR"));
+
+        let with: HashMap<_, _> =
+            resolve_runner_env(Some("http://10.0.0.9:8090/"), missing, missing_tmp)
                 .into_iter()
                 .collect();
         assert_eq!(
-            env_none.get("DOCKER_BUILDKIT").map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(
-            env_none.get("COMPOSE_DOCKER_CLI_BUILD").map(String::as_str),
-            Some("1")
-        );
-        assert!(!env_none.contains_key("ACTIONS_CACHE_SERVICE_V2"));
-        assert!(!env_none.contains_key("RUNNER_WORKDIR"));
-
-        // Envelope cache_url takes precedence over fallback env var
-        let env_direct: HashMap<_, _> = resolve_runner_env(
-            &sample_envelope(Some("http://10.0.0.9:8090"), Some("tok-123")),
-            Some("http://10.0.0.2:8090"),
-            missing,
-            missing_tmp,
-        )
-        .into_iter()
-        .collect();
-        assert_eq!(
-            env_direct
-                .get("ACTIONS_CACHE_SERVICE_V2")
-                .map(String::as_str),
+            with.get("ACTIONS_CACHE_SERVICE_V2").map(String::as_str),
             Some("true")
         );
         assert_eq!(
-            env_direct.get("ACTIONS_RESULTS_URL").map(String::as_str),
-            Some("http://10.0.0.9:8090")
+            with.get("ACTIONS_RESULTS_URL").map(String::as_str),
+            Some("http://10.0.0.9:8090/")
         );
-        assert_eq!(
-            env_direct.get("OPEN_CI_CACHE_TOKEN").map(String::as_str),
-            Some("tok-123")
-        );
-
-        // Fallback OPEN_CI_CACHE_URL used when envelope omits cache_url
-        let env_fallback: HashMap<_, _> = resolve_runner_env(
-            &sample_envelope(None, None),
-            Some("http://10.0.0.2:8090"),
-            missing,
-            missing_tmp,
-        )
-        .into_iter()
-        .collect();
-        assert_eq!(
-            env_fallback
-                .get("ACTIONS_CACHE_SERVICE_V2")
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            env_fallback.get("ACTIONS_RESULTS_URL").map(String::as_str),
-            Some("http://10.0.0.2:8090")
-        );
-        assert!(!env_fallback.contains_key("OPEN_CI_CACHE_TOKEN"));
+        assert!(!with.contains_key("OPEN_CI_CACHE_TOKEN"));
     }
 
     #[test]
@@ -410,10 +379,7 @@ mod tests {
         std::fs::create_dir_all(&work)?;
         std::fs::create_dir_all(&tmp)?;
 
-        let vars: HashMap<_, _> =
-            resolve_runner_env(&sample_envelope(None, None), None, &work, &tmp)
-                .into_iter()
-                .collect();
+        let vars: HashMap<_, _> = resolve_runner_env(None, &work, &tmp).into_iter().collect();
         assert_eq!(
             vars.get("RUNNER_WORKDIR").map(String::as_str),
             Some(work.to_string_lossy().as_ref())

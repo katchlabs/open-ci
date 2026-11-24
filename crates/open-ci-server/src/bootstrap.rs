@@ -44,13 +44,6 @@ fn hmac_hex(secret: &SecretString, msg: &[u8]) -> Result<String, ServerError> {
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Optional transparent Actions v2 cache endpoint and scoped bearer token injected into workers.
-#[derive(Clone, Debug)]
-pub struct CacheBootstrap<'a> {
-    pub url: &'a str,
-    pub token: Option<String>,
-}
-
 /// Structured cloud-init payload consumed by `open-ci agent bootstrap` baked into the Packer image.
 #[derive(Serialize)]
 struct AgentBootstrapEnvelope<'a> {
@@ -61,8 +54,6 @@ struct AgentBootstrapEnvelope<'a> {
     lifetime_seconds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_url: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_token: Option<String>,
 }
 
 /// Renders minimal, safe cloud-init user-data that hands JSON via stdin to `open-ci agent bootstrap`.
@@ -71,12 +62,8 @@ pub fn render_user_data(
     public_url: &str,
     worker_name: &str,
     lifetime_seconds: u64,
-    cache: Option<CacheBootstrap<'_>>,
+    cache_url: Option<&str>,
 ) -> Result<String, ServerError> {
-    let (cache_url, cache_token) = match cache {
-        Some(cfg) => (Some(cfg.url), cfg.token),
-        None => (None, None),
-    };
     let envelope = AgentBootstrapEnvelope {
         public_url,
         worker_name,
@@ -84,7 +71,6 @@ pub fn render_user_data(
         usage_token: mint_usage_token(secret, worker_name)?,
         lifetime_seconds,
         cache_url,
-        cache_token,
     };
     let json = serde_json::to_string(&envelope)
         .map_err(|_| ServerError::InvalidConfig("failed serializing agent envelope".to_owned()))?;

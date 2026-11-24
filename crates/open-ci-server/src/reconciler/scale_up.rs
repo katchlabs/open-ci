@@ -1,7 +1,7 @@
 //! Pool scale-up planning, worker launch, and regional quota backoff recording.
 
 use super::ReconcileSummary;
-use crate::bootstrap::{CacheBootstrap, render_user_data};
+use crate::bootstrap::render_user_data;
 use crate::{ControlPlane, ServerError};
 use open_ci_core::config::{Placement, PoolConfig};
 use open_ci_core::reconcile::{
@@ -124,15 +124,12 @@ impl ControlPlane {
         // Persist Planned intent BEFORE calling the cloud API so crashes remain idempotent.
         self.store.upsert_worker(&worker).await?;
 
-        let cache_bootstrap = self
-            .build_cache_bootstrap(worker.admission_id.as_deref(), pool.lifetime_seconds, now)
-            .await?;
         let user_data = render_user_data(
             &self.secrets.bootstrap_secret,
             &self.config.server.public_url,
             &worker.name,
             pool.lifetime_seconds,
-            cache_bootstrap,
+            self.config.worker_cache_url(pool),
         )?;
         let provider = self.providers.get(placement.provider)?;
         let spec = InstanceSpec {
@@ -174,38 +171,6 @@ impl ControlPlane {
             }
         }
         Ok(())
-    }
-
-    async fn build_cache_bootstrap(
-        &self,
-        admission_id: Option<&str>,
-        lifetime_seconds: u64,
-        now: u64,
-    ) -> Result<Option<CacheBootstrap<'_>>, ServerError> {
-        let Some(cache_cfg) = &self.config.cache else {
-            return Ok(None);
-        };
-        let token = match &self.secrets.cache_signing_key {
-            Some(key) => {
-                let scope = match admission_id {
-                    Some(id) => self.store.get_admission(id).await?.map_or_else(
-                        || self.config.github_scope().display_target().to_owned(),
-                        |a| a.repository,
-                    ),
-                    None => self.config.github_scope().display_target().to_owned(),
-                };
-                let minted = open_ci_cache::issue_cache_token(key, &scope, lifetime_seconds, now)
-                    .map_err(|err| {
-                    ServerError::InvalidConfig(format!("cache token error: {err}"))
-                })?;
-                Some(minted)
-            }
-            None => None,
-        };
-        Ok(Some(CacheBootstrap {
-            url: &cache_cfg.public_url,
-            token,
-        }))
     }
 
     pub(super) async fn record_provider_backoff(

@@ -158,6 +158,7 @@ fn test_config(gh_url: String) -> OpenCiConfig {
             cloud_discovery_seconds: 60,
             prefer_cheapest: true,
             provider_weights: BTreeMap::new(),
+            transparent_cache: false,
             placements: vec![
                 mock_placement("us-west1", "us-west1-a", "n2d-standard-2", "subnet-a"),
                 mock_placement("us-east1", "us-east1-b", "c2d-standard-2", "subnet-b"),
@@ -261,7 +262,6 @@ async fn setup_e2e_harness(gh_url: String) -> Option<E2eHarness> {
         webhook_secret: SecretString::new("0123456789abcdef0123456789abcdef"),
         bootstrap_secret: SecretString::new("fedcba9876543210fedcba9876543210"),
         operator_token: Some(SecretString::new("operator-secret-token-12345678")),
-        cache_signing_key: None,
     };
     let oidc = cfg.github.oidc_trust.clone().map(|trust| {
         OidcVerifier::new(gh_url.clone(), trust, scope.clone(), reqwest::Client::new())
@@ -637,7 +637,6 @@ fn setup_org_harness(gh_url: String, mode: AdmissionMode) -> Option<E2eHarness> 
         webhook_secret: SecretString::new("0123456789abcdef0123456789abcdef"),
         bootstrap_secret: SecretString::new("fedcba9876543210fedcba9876543210"),
         operator_token: Some(SecretString::new("operator-secret-token-12345678")),
-        cache_signing_key: None,
     };
     let oidc = cfg.github.oidc_trust.clone().map(|trust| {
         OidcVerifier::new(gh_url.clone(), trust, scope.clone(), reqwest::Client::new())

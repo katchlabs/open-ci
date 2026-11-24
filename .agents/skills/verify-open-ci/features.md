@@ -39,15 +39,18 @@ All operator routes require `Authorization: Bearer <operator-token>` (unauthenti
 | `oidc` | Requires prior OIDC admission via `/v1/ingress/admit` before provisioning; un-admitted or rerun jobs fall back. |
 | `hybrid` | Supports both OIDC-admitted runs (with capacity reservation & fail-closed routing) and direct webhook-driven pools. |
 
-## 4. Transparent Cache Server (`crates/open-ci-cache/src/http.rs`)
+## 4. Transparent Cache Server (`crates/open-ci-cache/src/http/`)
 
 | Route | Auth & Limits | Expected Behavior |
 | --- | --- | --- |
 | `GET /healthz` | Public | Returns HTTP `200` (`ok`). |
-| `POST /twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry` | Scoped HMAC bearer token, Twirp body cap | Reserves cache key+version within token scope; returns signed upload URL. |
-| `POST /twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload` | Scoped HMAC bearer token, Twirp body cap | Commits uploaded blob into SQLite index; idempotent within scope. |
-| `POST /twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL` | Scoped HMAC bearer token, Twirp body cap | Resolves exact/prefix key strictly within caller scope; returns signed download URL or miss. |
-| `PUT` / `GET` / `HEAD /v1/cache/blobs/{id}` | HMAC-signed URL query params (streaming body) | Streams blob bytes to/from `LocalFs` NVMe or SigV4 S3/R2; rejects tampered/expired signatures or path traversal. |
+| `POST /twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry` | `ACTIONS_RUNTIME_TOKEN` (RS256, repository allowlist), Twirp body cap | Reserves key+version in the token's writable ref; `409` on duplicates; returns signed upload URL. |
+| `POST /twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload` | `ACTIONS_RUNTIME_TOKEN`, Twirp body cap | Checks uploaded vs declared size, publishes the immutable entry in the SQLite index. |
+| `POST /twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL` | `ACTIONS_RUNTIME_TOKEN`, Twirp body cap | Searches readable refs in GitHub order (own ref, then base/default; exact then newest prefix); returns signed download URL or miss. |
+| `POST /twirp/{service}/{method}` | Forwarded unchanged | Non-cache Twirp calls (artifacts) proxy to `cache.upstream_results_url`; unknown `CacheService` methods `404`. |
+| `PUT` / `GET` / `HEAD /v1/cache/blobs/{id}` | HMAC-signed URL query params, required `Content-Length` | Streams bytes to/from the `local`, `s3`, or `gcs` blob store; rejects tampered/expired signatures. |
+
+Real-client proof: `./scripts/cache-client-e2e.sh [@actions/cache version]` drives the compiled binary with the official toolkit (single-shot and >128 MiB block uploads, byte-identical restores, ref isolation, immutability, foreign-repository rejection, artifact passthrough). Set `OPEN_CI_E2E_STORAGE_TOML` to run it against S3/GCS-compatible storage.
 
 ## 5. CLI & Action Entrypoints
 

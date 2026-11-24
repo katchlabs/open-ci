@@ -1,26 +1,25 @@
-//! High-speed GitHub Actions v2 transparent cache service for `open-ci`.
+//! GitHub Actions Cache Service v2 server for `open-ci` runners.
 //!
-//! Implements the GitHub Actions Cache v2 Twirp HTTP protocol
-//! (`github.actions.results.api.v1.CacheService`) and Azure Block Blob-compatible
-//! chunked upload/download endpoints so official `actions/cache` v4+ works transparently
-//! at LAN/`NVMe`/S3/R2 speed.
+//! Official `actions/cache` (and every toolkit-based cache client) talks to this service when the
+//! runner's `ACTIONS_RESULTS_URL` points here. Requests are authorized by the job's own runtime
+//! token, entries are isolated per repository and Git ref exactly like GitHub's cache, metadata
+//! lives in a `SQLite` [`CacheIndex`], and archives stream to a pluggable [`BlobStore`].
 
-pub mod auth;
+pub mod capability;
 pub mod config;
 pub mod error;
 pub mod http;
+pub mod ids;
 pub mod index;
+mod retention;
 pub mod storage;
 
-pub use auth::{
-    BlobOp, CacheTokenClaims, issue_cache_token, sign_blob_url, verify_blob_signature,
-    verify_cache_token,
-};
-pub use config::{
-    CacheBackendConfig, CacheConfig, DEFAULT_LISTEN_ADDR, DEFAULT_MAX_ENTRY_BYTES,
-    DEFAULT_MAX_TOTAL_BYTES, DEFAULT_SIGNED_URL_TTL_SECONDS, S3Config,
-};
+pub use config::CacheConfig;
 pub use error::CacheError;
-pub use http::{CacheServer, CacheState, build_cache_router};
-pub use index::{CacheEntry, CacheIndex};
-pub use storage::{BlobPayload, CacheStorage, LocalFsStorage, S3CompatibleStorage};
+pub use http::CacheServer;
+pub use ids::{BlobId, BlockId, ByteRange};
+pub use index::{
+    CacheEntry, CacheIndex, EntryKey, Reservation, RestoreQuery, RetentionPolicy, Swept,
+};
+pub use storage::{BlobStore, BlobUpload, ByteStream, LocalBlobStore};
+pub use storage::{GcsBlobStore, GcsStoreConfig, S3BlobStore, S3StoreConfig};

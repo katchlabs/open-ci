@@ -1,235 +1,448 @@
-//! In-memory and JSONL-serializable cache metadata index.
+//! `SQLite` index of cache entries and in-flight upload reservations.
+//!
+//! Entries are immutable and keyed by `(repository, ref scope, version, key)`, matching GitHub:
+//! a scope's key is saved once, and restores search scopes in the caller's read order.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use crate::error::CacheError;
+use crate::ids::BlobId;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-/// A committed cache entry scoped to a specific tenant/repository.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheEntry {
-    pub entry_id: u64,
+const SECONDS_PER_DAY: u64 = 86_400;
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS entries (
+    id               INTEGER PRIMARY KEY,
+    repository_id    INTEGER NOT NULL,
+    scope            TEXT    NOT NULL,
+    version          TEXT    NOT NULL,
+    key              TEXT    NOT NULL,
+    blob_id          TEXT    NOT NULL UNIQUE,
+    size_bytes       INTEGER NOT NULL,
+    created_at       INTEGER NOT NULL,
+    last_accessed_at INTEGER NOT NULL,
+    UNIQUE (repository_id, scope, version, key)
+);
+CREATE INDEX IF NOT EXISTS entries_by_last_access ON entries (last_accessed_at);
+CREATE TABLE IF NOT EXISTS reservations (
+    repository_id INTEGER NOT NULL,
+    scope         TEXT    NOT NULL,
+    version       TEXT    NOT NULL,
+    key           TEXT    NOT NULL,
+    blob_id       TEXT    NOT NULL UNIQUE,
+    stale_after   INTEGER NOT NULL,
+    PRIMARY KEY (repository_id, scope, version, key)
+);
+";
+
+/// Identity of one immutable cache entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryKey {
+    pub repository_id: u64,
     pub scope: String,
-    pub key: String,
     pub version: String,
-    pub blob_id: String,
+    pub key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheEntry {
+    pub id: i64,
+    pub key: EntryKey,
+    pub blob: BlobId,
     pub size_bytes: u64,
     pub created_at: u64,
     pub last_accessed_at: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct EntryLookupKey {
-    scope: String,
-    key: String,
-    version: String,
+/// A restore lookup: scopes in search order, then the primary key, then restore-key prefixes.
+#[derive(Debug)]
+pub struct RestoreQuery<'a> {
+    pub repository_id: u64,
+    pub version: &'a str,
+    pub scopes: &'a [&'a str],
+    pub primary_key: &'a str,
+    pub restore_keys: &'a [String],
 }
 
-/// Pending upload reservation created by `CreateCacheEntry` and finalized by
-/// `FinalizeCacheEntryUpload`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reservation {
+    Reserved,
+    AlreadyExists,
+}
+
+/// Retention limits applied by [`CacheIndex::sweep`].
+#[derive(Clone, Copy, Debug)]
+pub struct RetentionPolicy {
+    pub max_total_bytes: u64,
+    pub max_unused_days: u32,
+}
+
+/// Rows removed by a sweep; their blobs must be deleted from the blob store.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Swept {
+    pub blobs: Vec<BlobId>,
+}
+
 #[derive(Clone, Debug)]
-pub struct PendingUpload {
-    pub blob_id: String,
-    pub created_at: u64,
-}
-
-/// Scoped cache entry metadata index supporting exact matches and `restore_keys` prefix lookups.
-#[derive(Debug, Default)]
 pub struct CacheIndex {
-    entries: HashMap<EntryLookupKey, CacheEntry>,
-    pending: HashMap<EntryLookupKey, PendingUpload>,
-    next_entry_id: u64,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl CacheIndex {
-    /// Constructs a [`CacheIndex`] hydrated from persisted entries.
-    pub fn from_entries(entries: Vec<CacheEntry>) -> Self {
-        let mut index = Self {
-            entries: HashMap::new(),
-            pending: HashMap::new(),
-            next_entry_id: 1,
-        };
-        for entry in entries {
-            if entry.entry_id >= index.next_entry_id {
-                index.next_entry_id = entry.entry_id.saturating_add(1);
+    pub async fn open(path: &Path) -> Result<Self, CacheError> {
+        let path = path.to_path_buf();
+        let conn = tokio::task::spawn_blocking(move || -> Result<Connection, CacheError> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    CacheError::Storage(format!("creating index directory: {err}"))
+                })?;
             }
-            let lookup = EntryLookupKey {
-                scope: entry.scope.clone(),
-                key: entry.key.clone(),
-                version: entry.version.clone(),
-            };
-            index.entries.insert(lookup, entry);
-        }
-        index
+            let conn = Connection::open(&path)?;
+            // The index is rebuildable cache metadata, so WAL with NORMAL sync trades the last
+            // few commits on power loss for fewer fsyncs; entries lost that way are just misses.
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+            conn.execute_batch(SCHEMA)?;
+            Ok(conn)
+        })
+        .await
+        .map_err(|err| join_error(&err))??;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
-    /// Registers a pending upload reservation for `(scope, key, version)`.
-    pub fn register_pending(
-        &mut self,
-        scope: &str,
-        key: &str,
-        version: &str,
-        blob_id: String,
-        now_unix: u64,
-    ) {
-        let lookup = EntryLookupKey {
-            scope: scope.to_owned(),
-            key: key.to_owned(),
-            version: version.to_owned(),
-        };
-        self.pending.insert(
-            lookup,
-            PendingUpload {
-                blob_id,
-                created_at: now_unix,
-            },
-        );
+    pub fn open_in_memory() -> Result<Self, CacheError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
-    /// Consumes and returns a pending upload reservation for `(scope, key, version)`.
-    pub fn take_pending(&mut self, scope: &str, key: &str, version: &str) -> Option<PendingUpload> {
-        let lookup = EntryLookupKey {
-            scope: scope.to_owned(),
-            key: key.to_owned(),
-            version: version.to_owned(),
-        };
-        self.pending.remove(&lookup)
+    async fn with_conn<T, F>(&self, work: F) -> Result<T, CacheError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, CacheError> + Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn
+                .lock()
+                .map_err(|_| CacheError::Internal("cache index lock poisoned".to_owned()))?;
+            work(&mut guard)
+        })
+        .await
+        .map_err(|err| join_error(&err))?
     }
 
-    /// Commits a finalized cache entry and returns the entry plus any displaced blob ID.
-    pub fn commit_entry(
-        &mut self,
-        scope: &str,
-        key: &str,
-        version: &str,
-        blob_id: String,
-        size_bytes: u64,
-        now_unix: u64,
-    ) -> (CacheEntry, Option<String>) {
-        if self.next_entry_id == 0 {
-            self.next_entry_id = 1;
-        }
-        let entry_id = self.next_entry_id;
-        self.next_entry_id = self.next_entry_id.saturating_add(1);
-
-        let entry = CacheEntry {
-            entry_id,
-            scope: scope.to_owned(),
-            key: key.to_owned(),
-            version: version.to_owned(),
-            blob_id,
-            size_bytes,
-            created_at: now_unix,
-            last_accessed_at: now_unix,
-        };
-        let lookup = EntryLookupKey {
-            scope: scope.to_owned(),
-            key: key.to_owned(),
-            version: version.to_owned(),
-        };
-        let replaced_blob = self
-            .entries
-            .insert(lookup, entry.clone())
-            .filter(|old| old.blob_id != entry.blob_id)
-            .map(|old| old.blob_id);
-        (entry, replaced_blob)
-    }
-
-    /// Resolves candidates for `(scope, key, version)` and `restore_keys` in priority order.
-    ///
-    /// Order:
-    /// 1. Exact `(scope, key, version)` match if present.
-    /// 2. For each prefix in `restore_keys`, all matching `(scope, version)` entries sorted
-    ///    newest-first by `(created_at, entry_id)`.
-    pub fn find_candidates(
+    /// Reserves `key` for an upload into `blob`. Fails when the entry exists or another upload
+    /// holds a live reservation; a stale reservation is replaced and its blob returned for cleanup.
+    pub async fn reserve(
         &self,
-        scope: &str,
-        key: &str,
-        restore_keys: &[String],
-        version: &str,
-    ) -> Vec<CacheEntry> {
-        let mut results = Vec::new();
-        let exact_key = EntryLookupKey {
-            scope: scope.to_owned(),
-            key: key.to_owned(),
-            version: version.to_owned(),
-        };
-        if let Some(exact) = self.entries.get(&exact_key) {
-            results.push(exact.clone());
-        }
+        key: EntryKey,
+        blob: BlobId,
+        now: u64,
+        stale_after: u64,
+    ) -> Result<(Reservation, Option<BlobId>), CacheError> {
+        self.with_conn(move |conn| {
+            let tx = conn.transaction()?;
+            let committed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries
+                     WHERE repository_id = ?1 AND scope = ?2 AND version = ?3 AND key = ?4)",
+                params![sql_u64(key.repository_id)?, key.scope, key.version, key.key],
+                |row| row.get(0),
+            )?;
+            if committed {
+                return Ok((Reservation::AlreadyExists, None));
+            }
+            let existing: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT blob_id, stale_after FROM reservations
+                     WHERE repository_id = ?1 AND scope = ?2 AND version = ?3 AND key = ?4",
+                    params![sql_u64(key.repository_id)?, key.scope, key.version, key.key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((_, existing_stale_after)) = &existing
+                && sql_u64(now)? < *existing_stale_after
+            {
+                return Ok((Reservation::AlreadyExists, None));
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO reservations
+                 (repository_id, scope, version, key, blob_id, stale_after)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    sql_u64(key.repository_id)?,
+                    key.scope,
+                    key.version,
+                    key.key,
+                    blob.as_str(),
+                    sql_u64(stale_after)?
+                ],
+            )?;
+            tx.commit()?;
+            let replaced = existing
+                .map(|(blob_id, _)| BlobId::parse(&blob_id))
+                .transpose()?;
+            Ok((Reservation::Reserved, replaced))
+        })
+        .await
+    }
 
-        for prefix in restore_keys {
-            let mut matches: Vec<CacheEntry> = self
-                .entries
-                .values()
-                .filter(|entry| {
-                    entry.scope == scope
-                        && entry.version == version
-                        && entry.key.starts_with(prefix.as_str())
-                        && entry.key != key
-                })
-                .cloned()
-                .collect();
-            matches.sort_by(|a, b| {
-                b.created_at
-                    .cmp(&a.created_at)
-                    .then_with(|| b.entry_id.cmp(&a.entry_id))
-            });
-            for item in matches {
-                if !results
-                    .iter()
-                    .any(|existing| existing.entry_id == item.entry_id)
-                {
-                    results.push(item);
+    /// Whether `blob` still belongs to a live, unfinalized reservation and may receive bytes.
+    pub async fn accepts_upload(&self, blob: BlobId, now: u64) -> Result<bool, CacheError> {
+        self.with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reservations WHERE blob_id = ?1 AND stale_after > ?2)",
+                params![blob.as_str(), sql_u64(now)?],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
+    /// Removes and returns the reservation for `key`, if any.
+    pub async fn take_reservation(&self, key: EntryKey) -> Result<Option<BlobId>, CacheError> {
+        self.with_conn(move |conn| {
+            let blob: Option<String> = conn
+                .query_row(
+                    "DELETE FROM reservations
+                     WHERE repository_id = ?1 AND scope = ?2 AND version = ?3 AND key = ?4
+                     RETURNING blob_id",
+                    params![sql_u64(key.repository_id)?, key.scope, key.version, key.key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            blob.map(|id| BlobId::parse(&id)).transpose()
+        })
+        .await
+    }
+
+    /// Publishes an uploaded blob as the entry for `key`; `None` if the entry already exists.
+    pub async fn commit(
+        &self,
+        key: EntryKey,
+        blob: BlobId,
+        size_bytes: u64,
+        now: u64,
+    ) -> Result<Option<CacheEntry>, CacheError> {
+        self.with_conn(move |conn| {
+            let inserted = conn
+                .execute(
+                    "INSERT INTO entries
+                     (repository_id, scope, version, key, blob_id, size_bytes, created_at, last_accessed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                     ON CONFLICT (repository_id, scope, version, key) DO NOTHING",
+                    params![
+                        sql_u64(key.repository_id)?,
+                        key.scope,
+                        key.version,
+                        key.key,
+                        blob.as_str(),
+                        sql_u64(size_bytes)?,
+                        sql_u64(now)?
+                    ],
+                )
+                ?;
+            if inserted == 0 {
+                return Ok(None);
+            }
+            Ok(Some(CacheEntry {
+                id: conn.last_insert_rowid(),
+                key,
+                blob,
+                size_bytes,
+                created_at: now,
+                last_accessed_at: now,
+            }))
+        })
+        .await
+    }
+
+    /// First match in GitHub order: per scope, per key (primary then restore keys), exact then
+    /// newest prefix match.
+    pub async fn find(&self, query: &RestoreQuery<'_>) -> Result<Option<CacheEntry>, CacheError> {
+        let repository_id = sql_u64(query.repository_id)?;
+        let version = query.version.to_owned();
+        let scopes: Vec<String> = query.scopes.iter().map(|s| (*s).to_owned()).collect();
+        let keys: Vec<String> = std::iter::once(query.primary_key.to_owned())
+            .chain(query.restore_keys.iter().cloned())
+            .collect();
+        self.with_conn(move |conn| {
+            let mut exact = conn.prepare_cached(FIND_EXACT)?;
+            let mut prefix = conn.prepare_cached(FIND_NEWEST_PREFIX)?;
+            for scope in &scopes {
+                for key in &keys {
+                    for statement in [&mut exact, &mut prefix] {
+                        let found = statement
+                            .query_row(params![repository_id, scope, version, key], EntryRow::read)
+                            .optional()?;
+                        if let Some(row) = found {
+                            return CacheEntry::try_from(row).map(Some);
+                        }
+                    }
                 }
             }
-        }
-        results
+            Ok(None)
+        })
+        .await
     }
 
-    /// Updates `last_accessed_at` for a matched entry.
-    pub fn touch(&mut self, scope: &str, key: &str, version: &str, now_unix: u64) {
-        let lookup = EntryLookupKey {
-            scope: scope.to_owned(),
-            key: key.to_owned(),
-            version: version.to_owned(),
-        };
-        if let Some(entry) = self.entries.get_mut(&lookup) {
-            entry.last_accessed_at = now_unix;
-        }
+    pub async fn touch(&self, entry_id: i64, now: u64) -> Result<(), CacheError> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE entries SET last_accessed_at = ?2 WHERE id = ?1",
+                params![entry_id, sql_u64(now)?],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
-    /// Removes an entry (e.g., if its backing blob was evicted).
-    pub fn remove(&mut self, scope: &str, key: &str, version: &str) {
-        let lookup = EntryLookupKey {
-            scope: scope.to_owned(),
-            key: key.to_owned(),
-            version: version.to_owned(),
-        };
-        self.entries.remove(&lookup);
+    pub async fn remove(&self, entry_id: i64) -> Result<(), CacheError> {
+        self.with_conn(move |conn| {
+            conn.execute("DELETE FROM entries WHERE id = ?1", params![entry_id])?;
+            Ok(())
+        })
+        .await
     }
 
-    /// Snapshots all committed entries for persistence.
-    pub fn snapshot(&self) -> Vec<CacheEntry> {
-        let mut list: Vec<CacheEntry> = self.entries.values().cloned().collect();
-        list.sort_by_key(|entry| entry.entry_id);
-        list
+    pub async fn total_bytes(&self) -> Result<u64, CacheError> {
+        self.with_conn(|conn| {
+            let total: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM entries",
+                [],
+                |row| row.get(0),
+            )?;
+            from_sql_u64(total)
+        })
+        .await
+    }
+
+    /// Drops stale reservations, entries unused past retention, then least-recently-used entries
+    /// until the total fits the budget.
+    pub async fn sweep(&self, now: u64, policy: RetentionPolicy) -> Result<Swept, CacheError> {
+        self.with_conn(move |conn| {
+            let tx = conn.transaction()?;
+            let mut blobs = Vec::new();
+            collect_blobs(
+                &tx,
+                "DELETE FROM reservations WHERE stale_after <= ?1 RETURNING blob_id",
+                sql_u64(now)?,
+                &mut blobs,
+            )?;
+            let unused_cutoff = now
+                .saturating_sub(u64::from(policy.max_unused_days).saturating_mul(SECONDS_PER_DAY));
+            collect_blobs(
+                &tx,
+                "DELETE FROM entries WHERE last_accessed_at < ?1 RETURNING blob_id",
+                sql_u64(unused_cutoff)?,
+                &mut blobs,
+            )?;
+            collect_blobs(
+                &tx,
+                "DELETE FROM entries WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, SUM(size_bytes) OVER (
+                            ORDER BY last_accessed_at DESC, id DESC
+                        ) AS newer_total
+                        FROM entries
+                    ) WHERE newer_total > ?1
+                 ) RETURNING blob_id",
+                sql_u64(policy.max_total_bytes)?,
+                &mut blobs,
+            )?;
+            tx.commit()?;
+            Ok(Swept { blobs })
+        })
+        .await
     }
 }
 
-/// Encodes cache entries into newline-delimited JSON (JSONL).
-pub fn encode_jsonl(entries: &[CacheEntry]) -> Result<Vec<u8>, serde_json::Error> {
-    let mut out = Vec::new();
-    for entry in entries {
-        serde_json::to_writer(&mut out, entry)?;
-        out.push(b'\n');
-    }
-    Ok(out)
+const FIND_EXACT: &str = "SELECT id, repository_id, scope, version, key, blob_id, size_bytes,
+    created_at, last_accessed_at FROM entries
+    WHERE repository_id = ?1 AND scope = ?2 AND version = ?3 AND key = ?4";
+
+const FIND_NEWEST_PREFIX: &str =
+    "SELECT id, repository_id, scope, version, key, blob_id, size_bytes,
+    created_at, last_accessed_at FROM entries
+    WHERE repository_id = ?1 AND scope = ?2 AND version = ?3
+      AND key >= ?4 AND substr(key, 1, length(?4)) = ?4
+    ORDER BY created_at DESC, id DESC LIMIT 1";
+
+struct EntryRow {
+    id: i64,
+    repository_id: i64,
+    scope: String,
+    version: String,
+    key: String,
+    blob_id: String,
+    size_bytes: i64,
+    created_at: i64,
+    last_accessed_at: i64,
 }
 
-/// Decodes cache entries from newline-delimited JSON, skipping blank or malformed lines.
-pub fn decode_jsonl(raw: &str) -> Vec<CacheEntry> {
-    raw.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| serde_json::from_str::<CacheEntry>(line).ok())
-        .collect()
+impl EntryRow {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            repository_id: row.get(1)?,
+            scope: row.get(2)?,
+            version: row.get(3)?,
+            key: row.get(4)?,
+            blob_id: row.get(5)?,
+            size_bytes: row.get(6)?,
+            created_at: row.get(7)?,
+            last_accessed_at: row.get(8)?,
+        })
+    }
+}
+
+impl TryFrom<EntryRow> for CacheEntry {
+    type Error = CacheError;
+
+    fn try_from(row: EntryRow) -> Result<Self, CacheError> {
+        Ok(Self {
+            id: row.id,
+            key: EntryKey {
+                repository_id: from_sql_u64(row.repository_id)?,
+                scope: row.scope,
+                version: row.version,
+                key: row.key,
+            },
+            blob: BlobId::parse(&row.blob_id)?,
+            size_bytes: from_sql_u64(row.size_bytes)?,
+            created_at: from_sql_u64(row.created_at)?,
+            last_accessed_at: from_sql_u64(row.last_accessed_at)?,
+        })
+    }
+}
+
+fn collect_blobs(
+    tx: &rusqlite::Transaction<'_>,
+    sql: &str,
+    bound: i64,
+    blobs: &mut Vec<BlobId>,
+) -> Result<(), CacheError> {
+    let mut statement = tx.prepare(sql)?;
+    let ids = statement.query_map(params![bound], |row| row.get::<_, String>(0))?;
+    for id in ids {
+        blobs.push(BlobId::parse(&id?)?);
+    }
+    Ok(())
+}
+
+fn sql_u64(value: u64) -> Result<i64, CacheError> {
+    i64::try_from(value).map_err(|_| CacheError::BadRequest("value exceeds index range".to_owned()))
+}
+
+fn from_sql_u64(value: i64) -> Result<u64, CacheError> {
+    u64::try_from(value)
+        .map_err(|_| CacheError::Internal("negative value in cache index".to_owned()))
+}
+
+fn join_error(err: &tokio::task::JoinError) -> CacheError {
+    CacheError::Internal(format!("cache index task failed: {err}"))
 }

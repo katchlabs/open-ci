@@ -158,7 +158,6 @@ fn load_runtime_secrets(
                 webhook_secret: SecretString::new("demo-webhook-secret-0000000000000000"),
                 bootstrap_secret: SecretString::new("demo-bootstrap-secret-00000000000000"),
                 operator_token: Some(SecretString::new("demo-operator-token-000000000000")),
-                cache_signing_key: None,
             },
         ));
     }
@@ -166,7 +165,6 @@ fn load_runtime_secrets(
     let gh_token_path = std::env::var("OPEN_CI_GITHUB_TOKEN_FILE")
         .map_err(|_| anyhow!("set `OPEN_CI_GITHUB_TOKEN_FILE`"))?;
     let operator_token = read_optional_secret_file("OPEN_CI_OPERATOR_TOKEN_FILE")?;
-    let cache_signing_key = read_optional_secret_file("OPEN_CI_CACHE_SIGNING_KEY_FILE")?;
 
     Ok((
         Arc::new(FileGitHubToken::new(
@@ -177,7 +175,6 @@ fn load_runtime_secrets(
             webhook_secret: read_secret_file("OPEN_CI_WEBHOOK_SECRET_FILE")?,
             bootstrap_secret: read_secret_file("OPEN_CI_BOOTSTRAP_SECRET_FILE")?,
             operator_token,
-            cache_signing_key,
         },
     ))
 }

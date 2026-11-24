@@ -41,6 +41,7 @@ fn operator_test_config() -> OpenCiConfig {
             cloud_discovery_seconds: 60,
             prefer_cheapest: true,
             provider_weights: BTreeMap::new(),
+            transparent_cache: false,
             placements: vec![Placement {
                 provider: ProviderKind::Mock,
                 region: "us-west1".to_owned(),
@@ -147,7 +148,6 @@ fn setup_server() -> Option<(axum::Router, tempfile::TempDir)> {
             webhook_secret: SecretString::new("0123456789abcdef0123456789abcdef"),
             bootstrap_secret: SecretString::new("fedcba9876543210fedcba9876543210"),
             operator_token: Some(SecretString::new("super-secret-operator-token-1234")),
-            cache_signing_key: None,
         },
     )
     .ok()?;

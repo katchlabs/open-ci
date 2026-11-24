@@ -1,454 +1,538 @@
-//! Lightweight pure-Rust `SigV4` S3-compatible storage backend.
+//! Native `SigV4` S3-compatible blob store (AWS S3, Cloudflare R2, `MinIO`) with streaming bodies.
 //!
-//! Works with AWS S3, Cloudflare R2, `MinIO`, and GCS S3-interop without heavy SDK dependencies.
+//! Objects live at `{prefix}blobs/{blob}` and `{prefix}staging/{blob}/{block}` in a path-style
+//! bucket. Committing staged blocks builds the final object with a multipart upload, copying
+//! large blocks server-side and streaming runs of small blocks into parts of at least 5 MiB.
 
-use crate::auth::{validate_blob_id, validate_block_id};
-use crate::config::S3Config;
+mod client;
+mod sigv4;
+mod xml;
+
 use crate::error::CacheError;
-use crate::index::{CacheEntry, decode_jsonl, encode_jsonl};
-use crate::storage::{BlobPayload, CacheStorage, hash_block_id};
+use crate::ids::{BlobId, BlockId, ByteRange};
+use crate::storage::{BlobStore, BlobUpload, ByteStream};
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
-use hmac::{Hmac, Mac};
-use open_ci_core::{Clock, SystemClock};
-use reqwest::{Client, Method, StatusCode};
-use sha2::{Digest, Sha256};
+use client::{ObjectHead, S3Client};
+use futures_util::{StreamExt, TryStreamExt, stream};
+use open_ci_provider_aws::AwsCredentialsSource;
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
-use time::OffsetDateTime;
 
-type HmacSha256 = Hmac<Sha256>;
+const MIB: u64 = 1024 * 1024;
+/// S3 rejects single `PutObject` bodies above 5 GiB.
+const MAX_PUT_BYTES: u64 = 5 * 1024 * MIB;
+/// Azure `Put Block` maximum; keeps every multipart part under the 5 GiB S3 part limit.
+const MAX_BLOCK_BYTES: u64 = 4000 * MIB;
+const MIN_PART_BYTES: u64 = 5 * MIB;
+const MAX_PART_BYTES: u64 = 5 * 1024 * MIB;
+const MAX_PARTS: usize = 10_000;
+const MAX_PREFIX_BYTES: usize = 512;
+const HEAD_CONCURRENCY: usize = 16;
+const PART_CONCURRENCY: usize = 8;
+const DELETE_CONCURRENCY: usize = 16;
 
-const S3_SERVICE: &str = "s3";
-
-/// Pure-Rust AWS `SigV4` S3-compatible object storage backend.
-#[derive(Debug)]
-pub struct S3CompatibleStorage {
-    config: S3Config,
-    host: String,
-    base_url: String,
-    normalized_prefix: String,
-    client: Client,
-    clock: Arc<dyn Clock>,
+/// Location of the cache objects in an S3-compatible service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3StoreConfig {
+    /// Service origin such as `https://s3.us-east-1.amazonaws.com` or a `MinIO`/R2 URL.
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    /// Key prefix; normalized to empty or ending in `/`.
+    pub prefix: String,
 }
 
+/// [`BlobStore`] backed by an S3-compatible bucket using path-style addressing.
 #[derive(Debug)]
-struct SignedS3Headers {
-    amz_date: String,
-    payload_sha256: String,
-    authorization: String,
-    security_token: Option<String>,
+pub struct S3BlobStore {
+    client: Arc<S3Client>,
+    prefix: String,
 }
 
-impl S3CompatibleStorage {
-    /// Creates an [`S3CompatibleStorage`] using the system wall clock.
-    pub fn from_config(config: S3Config) -> Result<Self, CacheError> {
-        Self::new(config, Arc::new(SystemClock))
-    }
+#[derive(Clone, Debug)]
+struct StagedBlock {
+    key: String,
+    head: ObjectHead,
+}
 
-    /// Creates an [`S3CompatibleStorage`] with an injectable [`Clock`] (ideal for deterministic tests).
-    pub fn new(config: S3Config, clock: Arc<dyn Clock>) -> Result<Self, CacheError> {
-        config.validate()?;
-        let base_url = config.endpoint.trim().trim_end_matches('/').to_owned();
-        let host = extract_host(&base_url)?;
-        let trimmed_prefix = config.prefix.trim().trim_matches('/');
-        let normalized_prefix = if trimmed_prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{trimmed_prefix}/")
-        };
-
-        let client = Client::builder()
-            .timeout(Duration::from_secs(300))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("open-ci-cache/0.1")
-            .build()
-            .map_err(|err| {
-                CacheError::InvalidConfig(format!("failed building http client: {err}"))
-            })?;
-
+impl S3BlobStore {
+    pub fn new(
+        config: S3StoreConfig,
+        credentials: Arc<dyn AwsCredentialsSource>,
+        http: reqwest::Client,
+    ) -> Result<Self, CacheError> {
+        let (origin, host) = parse_endpoint(&config.endpoint)?;
+        validate_region(&config.region)?;
+        validate_bucket(&config.bucket)?;
+        let prefix = normalize_prefix(&config.prefix)?;
         Ok(Self {
-            config,
-            host,
-            base_url,
-            normalized_prefix,
-            client,
-            clock,
+            client: Arc::new(S3Client {
+                http,
+                credentials,
+                origin,
+                host,
+                region: config.region,
+                bucket: config.bucket,
+            }),
+            prefix,
         })
     }
 
-    /// Issues a SigV4-signed `PUT` object request.
-    pub async fn put_object(&self, relative_key: &str, body: Bytes) -> Result<(), CacheError> {
-        let canonical_uri = self.canonical_uri(relative_key);
-        let url = format!("{}{canonical_uri}", self.base_url);
-        let signed = self.sign_request("PUT", &canonical_uri, &body)?;
-
-        let mut req = self
-            .client
-            .request(Method::PUT, &url)
-            .header("host", &self.host)
-            .header("x-amz-date", &signed.amz_date)
-            .header("x-amz-content-sha256", &signed.payload_sha256)
-            .header("authorization", &signed.authorization)
-            .header("content-type", "application/octet-stream")
-            .body(body);
-        if let Some(token) = &signed.security_token {
-            req = req.header("x-amz-security-token", token);
-        }
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|err| CacheError::Storage(format!("s3 PUT failed: {err}")))?;
-        if !resp.status().is_success() {
-            return Err(CacheError::Storage(format!(
-                "s3 PUT rejected with HTTP {}",
-                resp.status().as_u16()
-            )));
-        }
-        Ok(())
+    fn blob_key(&self, blob: &BlobId) -> String {
+        format!("{}blobs/{blob}", self.prefix)
     }
 
-    /// Issues a SigV4-signed `GET` object request. Returns `Ok(None)` on `404 Not Found`.
-    pub async fn get_object(&self, relative_key: &str) -> Result<Option<Bytes>, CacheError> {
-        let canonical_uri = self.canonical_uri(relative_key);
-        let url = format!("{}{canonical_uri}", self.base_url);
-        let signed = self.sign_request("GET", &canonical_uri, &[])?;
-
-        let mut req = self
-            .client
-            .request(Method::GET, &url)
-            .header("host", &self.host)
-            .header("x-amz-date", &signed.amz_date)
-            .header("x-amz-content-sha256", &signed.payload_sha256)
-            .header("authorization", &signed.authorization);
-        if let Some(token) = &signed.security_token {
-            req = req.header("x-amz-security-token", token);
-        }
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|err| CacheError::Storage(format!("s3 GET failed: {err}")))?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            return Err(CacheError::Storage(format!(
-                "s3 GET rejected with HTTP {}",
-                resp.status().as_u16()
-            )));
-        }
-        let data = resp
-            .bytes()
-            .await
-            .map_err(|err| CacheError::Storage(format!("failed reading s3 GET body: {err}")))?;
-        Ok(Some(data))
+    fn staging_prefix(&self, blob: &BlobId) -> String {
+        format!("{}staging/{blob}/", self.prefix)
     }
 
-    /// Issues a SigV4-signed `HEAD` object request. Returns `Ok(None)` on `404 Not Found`.
-    pub async fn head_object(&self, relative_key: &str) -> Result<Option<u64>, CacheError> {
-        let canonical_uri = self.canonical_uri(relative_key);
-        let url = format!("{}{canonical_uri}", self.base_url);
-        let signed = self.sign_request("HEAD", &canonical_uri, &[])?;
-
-        let mut req = self
-            .client
-            .request(Method::HEAD, &url)
-            .header("host", &self.host)
-            .header("x-amz-date", &signed.amz_date)
-            .header("x-amz-content-sha256", &signed.payload_sha256)
-            .header("authorization", &signed.authorization);
-        if let Some(token) = &signed.security_token {
-            req = req.header("x-amz-security-token", token);
-        }
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|err| CacheError::Storage(format!("s3 HEAD failed: {err}")))?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            return Err(CacheError::Storage(format!(
-                "s3 HEAD rejected with HTTP {}",
-                resp.status().as_u16()
-            )));
-        }
-        let len = resp
-            .headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        Ok(Some(len))
+    fn block_key(&self, blob: &BlobId, block: &BlockId) -> String {
+        format!("{}{}", self.staging_prefix(blob), block.storage_name())
     }
 
-    /// Issues a SigV4-signed `DELETE` object request.
-    pub async fn delete_object(&self, relative_key: &str) -> Result<(), CacheError> {
-        let canonical_uri = self.canonical_uri(relative_key);
-        let url = format!("{}{canonical_uri}", self.base_url);
-        let signed = self.sign_request("DELETE", &canonical_uri, &[])?;
-
-        let mut req = self
-            .client
-            .request(Method::DELETE, &url)
-            .header("host", &self.host)
-            .header("x-amz-date", &signed.amz_date)
-            .header("x-amz-content-sha256", &signed.payload_sha256)
-            .header("authorization", &signed.authorization);
-        if let Some(token) = &signed.security_token {
-            req = req.header("x-amz-security-token", token);
-        }
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|err| CacheError::Storage(format!("s3 DELETE failed: {err}")))?;
-        if resp.status() == StatusCode::NOT_FOUND || resp.status().is_success() {
-            return Ok(());
-        }
-        Err(CacheError::Storage(format!(
-            "s3 DELETE rejected with HTTP {}",
-            resp.status().as_u16()
-        )))
-    }
-
-    fn blob_key(blob_id: &str) -> String {
-        format!("blobs/{blob_id}")
-    }
-
-    fn staged_block_key(blob_id: &str, block_id: &str) -> String {
-        format!("staging/{blob_id}/{}", hash_block_id(block_id))
-    }
-
-    fn canonical_uri(&self, relative_key: &str) -> String {
-        let full_key = format!(
-            "{}{}",
-            self.normalized_prefix,
-            relative_key.trim_start_matches('/')
-        );
-        let encoded_bucket = encode_uri_segment(&self.config.bucket);
-        let encoded_key = full_key
-            .split('/')
-            .map(encode_uri_segment)
-            .collect::<Vec<_>>()
-            .join("/");
-        format!("/{encoded_bucket}/{encoded_key}")
-    }
-
-    fn sign_request(
+    async fn head_staged(
         &self,
-        method: &str,
-        canonical_uri: &str,
-        body: &[u8],
-    ) -> Result<SignedS3Headers, CacheError> {
-        let now_unix = self.clock.now_unix();
-        let ts = i64::try_from(now_unix)
-            .map_err(|_| CacheError::Internal("unix timestamp overflow".to_owned()))?;
-        let dt = OffsetDateTime::from_unix_timestamp(ts)
-            .map_err(|_| CacheError::Internal("invalid unix timestamp".to_owned()))?;
+        blob: &BlobId,
+        blocks: &[BlockId],
+    ) -> Result<Vec<StagedBlock>, CacheError> {
+        let distinct: HashSet<String> = blocks
+            .iter()
+            .map(|block| self.block_key(blob, block))
+            .collect();
+        let heads: HashMap<String, Option<ObjectHead>> = stream::iter(distinct)
+            .map(|key| async move {
+                let head = self.client.head_object(&key).await?;
+                Ok::<_, CacheError>((key, head))
+            })
+            .buffer_unordered(HEAD_CONCURRENCY)
+            .try_collect()
+            .await?;
+        blocks
+            .iter()
+            .map(|block| {
+                let key = self.block_key(blob, block);
+                let head = heads.get(&key).cloned().flatten().ok_or_else(|| {
+                    CacheError::BadRequest(format!("staged block not found: {}", block.as_str()))
+                })?;
+                Ok(StagedBlock { key, head })
+            })
+            .collect()
+    }
 
-        let date_stamp = format!("{:04}{:02}{:02}", dt.year(), u8::from(dt.month()), dt.day());
-        let amz_date = format!(
-            "{date_stamp}T{:02}{:02}{:02}Z",
-            dt.hour(),
-            dt.minute(),
-            dt.second()
-        );
-        let payload_sha256 = sha256_hex(body);
-        let host_lower = self.host.to_ascii_lowercase();
-
-        let (canonical_headers, signed_headers, security_token) = if let Some(token) =
-            &self.config.session_token
+    async fn join(&self, target: &str, blocks: &[StagedBlock]) -> Result<(), CacheError> {
+        let sizes: Vec<u64> = blocks.iter().map(|block| block.head.size).collect();
+        let plan = plan_parts(&sizes)?;
+        let upload_id = self.client.create_multipart_upload(target).await?;
+        let joined = self
+            .upload_and_complete(target, &upload_id, blocks, plan)
+            .await;
+        if joined.is_err()
+            && let Err(abort) = self.client.abort_multipart_upload(target, &upload_id).await
         {
-            let exposed = token.expose().to_owned();
-            (
-                format!(
-                    "host:{host_lower}\nx-amz-content-sha256:{payload_sha256}\nx-amz-date:{amz_date}\nx-amz-security-token:{exposed}\n"
-                ),
-                "host;x-amz-content-sha256;x-amz-date;x-amz-security-token",
-                Some(exposed),
-            )
-        } else {
-            (
-                format!(
-                    "host:{host_lower}\nx-amz-content-sha256:{payload_sha256}\nx-amz-date:{amz_date}\n"
-                ),
-                "host;x-amz-content-sha256;x-amz-date",
-                None,
-            )
-        };
+            tracing::warn!(error = %abort, "failed to abort s3 multipart upload");
+        }
+        joined
+    }
 
-        let canonical_request = format!(
-            "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_sha256}"
-        );
-        let credential_scope = format!(
-            "{date_stamp}/{}/{S3_SERVICE}/aws4_request",
-            self.config.region
-        );
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
-            sha256_hex(canonical_request.as_bytes())
-        );
+    async fn upload_and_complete(
+        &self,
+        target: &str,
+        upload_id: &str,
+        blocks: &[StagedBlock],
+        plan: Vec<Range<usize>>,
+    ) -> Result<(), CacheError> {
+        let parts: Vec<(u32, String)> = stream::iter(plan.into_iter().zip(1u32..))
+            .map(|(range, number)| async move {
+                let etag = self
+                    .upload_group(target, upload_id, number, &blocks[range])
+                    .await?;
+                Ok::<_, CacheError>((number, etag))
+            })
+            .buffered(PART_CONCURRENCY)
+            .try_collect()
+            .await?;
+        self.client
+            .complete_multipart_upload(target, upload_id, &parts)
+            .await
+    }
 
-        let k_date = hmac_sha256(
-            format!("AWS4{}", self.config.secret_access_key.expose()).as_bytes(),
-            date_stamp.as_bytes(),
-        )?;
-        let k_region = hmac_sha256(&k_date, self.config.region.as_bytes())?;
-        let k_service = hmac_sha256(&k_region, S3_SERVICE.as_bytes())?;
-        let k_signing = hmac_sha256(&k_service, b"aws4_request")?;
-        let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes())?);
+    async fn upload_group(
+        &self,
+        target: &str,
+        upload_id: &str,
+        number: u32,
+        group: &[StagedBlock],
+    ) -> Result<String, CacheError> {
+        if let [single] = group {
+            return self
+                .client
+                .upload_part_copy(target, upload_id, number, &single.key, &single.head.etag)
+                .await;
+        }
+        let body = self.concatenated(group);
+        self.client
+            .upload_part(target, upload_id, number, body)
+            .await
+    }
 
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
-            self.config.access_key_id
-        );
+    /// Streams staged blocks back-to-back, each pinned to the `ETag` seen when sizing the join.
+    fn concatenated(&self, group: &[StagedBlock]) -> BlobUpload {
+        let total = group.iter().map(|block| block.head.size).sum();
+        let client = Arc::clone(&self.client);
+        let body = stream::iter(group.to_vec())
+            .then(move |block| {
+                let client = Arc::clone(&client);
+                async move {
+                    client
+                        .get_object(&block.key, None, Some(&block.head.etag))
+                        .await
+                        .map_err(|err| io::Error::other(err.to_string()))
+                }
+            })
+            .try_flatten()
+            .boxed();
+        BlobUpload::new(total, body)
+    }
 
-        Ok(SignedS3Headers {
-            amz_date,
-            payload_sha256,
-            authorization,
-            security_token,
-        })
+    async fn delete_staging(&self, blob: &BlobId) -> Result<(), CacheError> {
+        let prefix = self.staging_prefix(blob);
+        let mut token = None;
+        loop {
+            let page = self.client.list_objects(&prefix, token.as_deref()).await?;
+            stream::iter(page.keys.into_iter().map(Ok::<_, CacheError>))
+                .try_for_each_concurrent(DELETE_CONCURRENCY, |key| async move {
+                    self.client.delete_object(&key).await
+                })
+                .await?;
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => return Ok(()),
+            }
+        }
     }
 }
 
 #[async_trait]
-impl CacheStorage for S3CompatibleStorage {
-    async fn put_blob(&self, blob_id: &str, data: Bytes) -> Result<u64, CacheError> {
-        validate_blob_id(blob_id)?;
-        let size = data.len() as u64;
-        self.put_object(&Self::blob_key(blob_id), data).await?;
-        Ok(size)
+impl BlobStore for S3BlobStore {
+    async fn put(&self, blob: &BlobId, upload: BlobUpload) -> Result<(), CacheError> {
+        ensure_at_most(upload.content_length(), MAX_PUT_BYTES)?;
+        self.client.put_object(&self.blob_key(blob), upload).await
     }
 
     async fn stage_block(
         &self,
-        blob_id: &str,
-        block_id: &str,
-        data: Bytes,
-    ) -> Result<u64, CacheError> {
-        validate_blob_id(blob_id)?;
-        validate_block_id(block_id)?;
-        let size = data.len() as u64;
-        self.put_object(&Self::staged_block_key(blob_id, block_id), data)
-            .await?;
-        Ok(size)
+        blob: &BlobId,
+        block: &BlockId,
+        upload: BlobUpload,
+    ) -> Result<(), CacheError> {
+        ensure_at_most(upload.content_length(), MAX_BLOCK_BYTES)?;
+        self.client
+            .put_object(&self.block_key(blob, block), upload)
+            .await
     }
 
     async fn commit_blocks(
         &self,
-        blob_id: &str,
-        block_ids: &[String],
-        max_entry_bytes: u64,
+        blob: &BlobId,
+        blocks: &[BlockId],
+        max_size: u64,
     ) -> Result<u64, CacheError> {
-        validate_blob_id(blob_id)?;
-        if block_ids.is_empty() {
+        if blocks.is_empty() {
             return Err(CacheError::BadRequest(
                 "block list must not be empty".to_owned(),
             ));
         }
+        let mut staged = self.head_staged(blob, blocks).await?;
+        let total = staged
+            .iter()
+            .try_fold(0u64, |acc, block| acc.checked_add(block.head.size))
+            .filter(|total| *total <= max_size)
+            .ok_or_else(|| {
+                CacheError::PayloadTooLarge(format!("joined blob exceeds {max_size} bytes"))
+            })?;
 
-        let mut assembled = BytesMut::new();
-        for block_id in block_ids {
-            validate_block_id(block_id)?;
-            let key = Self::staged_block_key(blob_id, block_id);
-            let Some(chunk) = self.get_object(&key).await? else {
-                return Err(CacheError::BadRequest(format!(
-                    "staged block not found: {block_id}"
-                )));
-            };
-            let next_len = (assembled.len() as u64).saturating_add(chunk.len() as u64);
-            if next_len > max_entry_bytes {
-                return Err(CacheError::PayloadTooLarge(format!(
-                    "assembled blob exceeds max_entry_bytes ({max_entry_bytes})"
-                )));
-            }
-            assembled.extend_from_slice(&chunk);
+        let target = self.blob_key(blob);
+        staged.retain(|block| block.head.size > 0);
+        if staged.is_empty() {
+            self.client.put_empty_object(&target).await?;
+        } else {
+            self.join(&target, &staged).await?;
         }
-
-        let total = assembled.len() as u64;
-        self.put_object(&Self::blob_key(blob_id), assembled.freeze())
-            .await?;
-        for block_id in block_ids {
-            let _ = self
-                .delete_object(&Self::staged_block_key(blob_id, block_id))
-                .await;
+        if let Err(err) = self.delete_staging(blob).await {
+            tracing::warn!(error = %err, "committed blob but failed to remove staged blocks");
         }
         Ok(total)
     }
 
-    async fn get_blob(&self, blob_id: &str) -> Result<Option<BlobPayload>, CacheError> {
-        validate_blob_id(blob_id)?;
+    async fn size(&self, blob: &BlobId) -> Result<Option<u64>, CacheError> {
         Ok(self
-            .get_object(&Self::blob_key(blob_id))
+            .client
+            .head_object(&self.blob_key(blob))
             .await?
-            .map(BlobPayload::Bytes))
+            .map(|head| head.size))
     }
 
-    async fn head_blob(&self, blob_id: &str) -> Result<Option<u64>, CacheError> {
-        validate_blob_id(blob_id)?;
-        self.head_object(&Self::blob_key(blob_id)).await
+    async fn read(&self, blob: &BlobId, range: ByteRange) -> Result<ByteStream, CacheError> {
+        self.client
+            .get_object(&self.blob_key(blob), Some(range), None)
+            .await
     }
 
-    async fn delete_blob(&self, blob_id: &str) -> Result<(), CacheError> {
-        validate_blob_id(blob_id)?;
-        self.delete_object(&Self::blob_key(blob_id)).await
-    }
-
-    async fn load_index(&self) -> Result<Vec<CacheEntry>, CacheError> {
-        let Some(bytes) = self.get_object("index.jsonl").await? else {
-            return Ok(Vec::new());
-        };
-        let raw = String::from_utf8_lossy(&bytes);
-        Ok(decode_jsonl(&raw))
-    }
-
-    async fn save_index(&self, entries: &[CacheEntry]) -> Result<(), CacheError> {
-        let bytes = encode_jsonl(entries)
-            .map_err(|err| CacheError::Storage(format!("failed serializing cache index: {err}")))?;
-        self.put_object("index.jsonl", Bytes::from(bytes)).await
+    async fn delete(&self, blob: &BlobId) -> Result<(), CacheError> {
+        self.client.delete_object(&self.blob_key(blob)).await?;
+        self.delete_staging(blob).await
     }
 }
 
-fn extract_host(base_url: &str) -> Result<String, CacheError> {
-    let without_scheme = base_url
-        .strip_prefix("https://")
-        .or_else(|| base_url.strip_prefix("http://"))
-        .ok_or_else(|| CacheError::InvalidConfig("invalid s3 endpoint scheme".to_owned()))?;
-    let host = without_scheme
-        .split('/')
-        .next()
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| CacheError::InvalidConfig("missing s3 endpoint host".to_owned()))?;
-    Ok(host.to_owned())
+fn ensure_at_most(content_length: u64, limit: u64) -> Result<(), CacheError> {
+    if content_length > limit {
+        return Err(CacheError::PayloadTooLarge(format!(
+            "s3 object body exceeds {limit} bytes"
+        )));
+    }
+    Ok(())
 }
 
-fn encode_uri_segment(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(char::from(byte));
-        } else {
-            out.push('%');
-            out.push_str(&hex::encode_upper([byte]));
+/// Splits positive block sizes into consecutive multipart parts: each part closes as soon as it
+/// reaches the 5 MiB S3 minimum, so a block that is at least 5 MiB on its own becomes a
+/// single-block (server-side copy) part and runs of smaller blocks are merged.
+fn plan_parts(sizes: &[u64]) -> Result<Vec<Range<usize>>, CacheError> {
+    let too_large =
+        || CacheError::PayloadTooLarge("staged blocks do not fit S3 multipart limits".to_owned());
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut part_bytes = 0u64;
+    for (index, size) in sizes.iter().enumerate() {
+        part_bytes = part_bytes
+            .checked_add(*size)
+            .filter(|bytes| *bytes <= MAX_PART_BYTES)
+            .ok_or_else(too_large)?;
+        if part_bytes >= MIN_PART_BYTES {
+            let end = index + 1;
+            parts.push(start..end);
+            start = end;
+            part_bytes = 0;
         }
     }
-    out
+    if start < sizes.len() {
+        parts.push(start..sizes.len());
+    }
+    if parts.len() > MAX_PARTS {
+        return Err(too_large());
+    }
+    Ok(parts)
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+fn parse_endpoint(endpoint: &str) -> Result<(String, String), CacheError> {
+    let invalid = |reason: &str| CacheError::InvalidConfig(format!("s3 endpoint {reason}"));
+    let url = reqwest::Url::parse(endpoint.trim()).map_err(|_| invalid("is not a valid URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(invalid("must use http or https"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("must not embed credentials"));
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid("must not contain a path, query, or fragment"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| invalid("must include a host"))?;
+    let host = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
+    Ok((format!("{}://{host}", url.scheme()), host))
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>, CacheError> {
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|_| CacheError::Internal("invalid hmac key".to_owned()))?;
-    mac.update(data);
-    Ok(mac.finalize().into_bytes().to_vec())
+fn validate_region(region: &str) -> Result<(), CacheError> {
+    let valid = !region.is_empty()
+        && region.len() <= 32
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(CacheError::InvalidConfig("invalid s3 region".to_owned()))
+    }
+}
+
+fn validate_bucket(bucket: &str) -> Result<(), CacheError> {
+    let bytes = bucket.as_bytes();
+    let edge_ok = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    let valid = (3..=63).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+        && edge_ok(bytes.first())
+        && edge_ok(bytes.last());
+    if valid {
+        Ok(())
+    } else {
+        Err(CacheError::InvalidConfig(
+            "invalid s3 bucket name".to_owned(),
+        ))
+    }
+}
+
+/// Empty, or `/`-terminated segments that survive URL path normalization unchanged.
+fn normalize_prefix(prefix: &str) -> Result<String, CacheError> {
+    let trimmed = prefix.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let valid = trimmed.len() < MAX_PREFIX_BYTES
+        && !trimmed.chars().any(char::is_control)
+        && trimmed
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".."));
+    if valid {
+        Ok(format!("{trimmed}/"))
+    } else {
+        Err(CacheError::InvalidConfig(
+            "invalid s3 key prefix".to_owned(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part_bytes(sizes: &[u64], part: &Range<usize>) -> u64 {
+        sizes[part.clone()].iter().sum()
+    }
+
+    fn assert_valid_plan(sizes: &[u64]) -> Result<(), CacheError> {
+        let plan = plan_parts(sizes)?;
+        let mut next = 0;
+        for (index, part) in plan.iter().enumerate() {
+            assert_eq!(part.start, next, "parts must be consecutive: {sizes:?}");
+            assert!(part.end > part.start, "parts must be non-empty: {sizes:?}");
+            let bytes = part_bytes(sizes, part);
+            assert!(bytes <= MAX_PART_BYTES, "part over 5 GiB: {sizes:?}");
+            if index + 1 < plan.len() {
+                assert!(
+                    bytes >= MIN_PART_BYTES,
+                    "non-last part under 5 MiB: {sizes:?}"
+                );
+            }
+            if part.len() > 1 {
+                let leading: u64 = sizes[part.start..part.end - 1].iter().sum();
+                assert!(
+                    leading < MIN_PART_BYTES,
+                    "merged a part that was already full"
+                );
+            }
+            next = part.end;
+        }
+        assert_eq!(next, sizes.len(), "parts must cover every block: {sizes:?}");
+        assert!(plan.len() <= MAX_PARTS);
+        Ok(())
+    }
+
+    #[test]
+    fn plans_copy_parts_for_large_blocks_and_merges_small_runs() -> Result<(), CacheError> {
+        let sizes = [6 * MIB, MIB, MIB, 7 * MIB + 3, 10];
+        assert_eq!(plan_parts(&sizes)?, vec![0..1, 1..4, 4..5]);
+        assert_eq!(plan_parts(&[10])?, vec![0..1]);
+        assert_eq!(plan_parts(&[MIB, MIB])?, vec![0..2]);
+        assert_eq!(
+            plan_parts(&[5 * MIB, 5 * MIB, 5 * MIB])?,
+            vec![0..1, 1..2, 2..3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plans_satisfy_s3_part_rules_for_pseudo_random_block_sequences() -> Result<(), CacheError> {
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seed >> 33
+        };
+        let choices = [
+            1,
+            4096,
+            MIB,
+            4 * MIB,
+            5 * MIB - 1,
+            5 * MIB,
+            32 * MIB,
+            MAX_BLOCK_BYTES,
+        ];
+        for _ in 0..2000 {
+            let count = usize::try_from(next() % 40 + 1).unwrap_or(1);
+            let sizes: Vec<u64> = (0..count)
+                .map(|_| {
+                    let pick = usize::try_from(next()).unwrap_or(0) % choices.len();
+                    choices[pick].saturating_sub(next() % 3).max(1)
+                })
+                .collect();
+            assert_valid_plan(&sizes)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_joins_that_need_more_than_ten_thousand_parts() {
+        let sizes = vec![MIN_PART_BYTES; MAX_PARTS + 1];
+        assert!(matches!(
+            plan_parts(&sizes),
+            Err(CacheError::PayloadTooLarge(_))
+        ));
+        assert!(plan_parts(&sizes[..MAX_PARTS]).is_ok());
+    }
+
+    #[test]
+    fn rejects_parts_over_five_gib() {
+        assert!(matches!(
+            plan_parts(&[MIB, MAX_PART_BYTES]),
+            Err(CacheError::PayloadTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn normalizes_prefix_and_validates_config() -> Result<(), CacheError> {
+        assert_eq!(normalize_prefix("")?, "");
+        assert_eq!(normalize_prefix("/")?, "");
+        assert_eq!(normalize_prefix("/team/cache/")?, "team/cache/");
+        assert_eq!(normalize_prefix("ci cache+v1")?, "ci cache+v1/");
+        for bad in ["a//b", "a/../b", "./a", "a\nb"] {
+            assert!(normalize_prefix(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            parse_endpoint("https://s3.us-east-1.amazonaws.com")?,
+            (
+                "https://s3.us-east-1.amazonaws.com".to_owned(),
+                "s3.us-east-1.amazonaws.com".to_owned()
+            )
+        );
+        assert_eq!(
+            parse_endpoint("http://127.0.0.1:9000/")?.1,
+            "127.0.0.1:9000"
+        );
+        for bad in [
+            "ftp://host",
+            "https://user:pw@host",
+            "https://host/bucket",
+            "https://host/?x=1",
+            "not a url",
+        ] {
+            assert!(parse_endpoint(bad).is_err(), "{bad}");
+        }
+        assert!(validate_bucket("open-ci.cache-1").is_ok());
+        for bad in ["ab", "Upper", "-lead", "trail-", "under_score"] {
+            assert!(validate_bucket(bad).is_err(), "{bad}");
+        }
+        assert!(validate_region("auto").is_ok());
+        assert!(validate_region("").is_err());
+        assert!(validate_region("US East").is_err());
+        Ok(())
+    }
 }

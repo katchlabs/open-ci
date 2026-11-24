@@ -1,17 +1,13 @@
 //! GitHub Actions OIDC RS256 JWT verifier with lock-free JWKS network refresh.
 
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
+use crate::jwks::{JwksError, RemoteJwks};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use open_ci_core::GitHubScope;
 use open_ci_core::config::OidcTrustConfig;
 use open_ci_core::models::repo_matches_pattern;
 use reqwest::Client;
 use serde::Deserialize;
-use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
-
-const MAX_JWKS_BYTES: usize = 64 * 1024;
-const FORCED_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum OidcError {
@@ -63,70 +59,18 @@ pub struct OidcVerifier {
     issuer: String,
     trust: OidcTrustConfig,
     scope: GitHubScope,
-    client: Client,
-    jwks_cache: RwLock<Option<(JwkSet, Instant)>>,
-    refresh_lock: Mutex<()>,
-    cache_ttl: Duration,
+    jwks: RemoteJwks,
 }
 
 impl OidcVerifier {
     pub fn new(issuer: String, trust: OidcTrustConfig, scope: GitHubScope, client: Client) -> Self {
+        let jwks = RemoteJwks::for_issuer(&issuer, client);
         Self {
             issuer,
             trust,
             scope,
-            client,
-            jwks_cache: RwLock::new(None),
-            refresh_lock: Mutex::new(()),
-            cache_ttl: Duration::from_secs(300),
+            jwks,
         }
-    }
-
-    async fn jwks(&self, force_refresh: bool) -> Result<JwkSet, OidcError> {
-        {
-            let guard = self.jwks_cache.read().await;
-            if let Some((set, fetched_at)) = guard.as_ref() {
-                let elapsed = fetched_at.elapsed();
-                if (!force_refresh && elapsed < self.cache_ttl)
-                    || (force_refresh && elapsed < FORCED_REFRESH_COOLDOWN)
-                {
-                    return Ok(set.clone());
-                }
-            }
-        }
-
-        // Singleflight mutex coalesces concurrent refreshes without blocking readers.
-        let _refresh_guard = self.refresh_lock.lock().await;
-        {
-            let guard = self.jwks_cache.read().await;
-            if let Some((set, fetched_at)) = guard.as_ref() {
-                let elapsed = fetched_at.elapsed();
-                if (!force_refresh && elapsed < self.cache_ttl)
-                    || (force_refresh && elapsed < FORCED_REFRESH_COOLDOWN)
-                {
-                    return Ok(set.clone());
-                }
-            }
-        }
-
-        let url = format!("{}/.well-known/jwks", self.issuer);
-        let resp = self
-            .client
-            .get(&url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .map_err(|_| OidcError::JwksUnavailable)?;
-        if !resp.status().is_success() {
-            return Err(OidcError::JwksUnavailable);
-        }
-        let body = resp.bytes().await.map_err(|_| OidcError::JwksUnavailable)?;
-        if body.len() > MAX_JWKS_BYTES {
-            return Err(OidcError::JwksUnavailable);
-        }
-        let jwks: JwkSet = serde_json::from_slice(&body).map_err(|_| OidcError::JwksUnavailable)?;
-        *self.jwks_cache.write().await = Some((jwks.clone(), Instant::now()));
-        Ok(jwks)
     }
 
     pub async fn verify(&self, token: &str) -> Result<OidcClaims, OidcError> {
@@ -142,13 +86,10 @@ impl OidcVerifier {
             return Err(OidcError::MalformedToken);
         }
 
-        let mut jwks = self.jwks(false).await?;
-        let mut jwk = jwks.find(&kid).cloned();
-        if jwk.is_none() {
-            jwks = self.jwks(true).await?;
-            jwk = jwks.find(&kid).cloned();
-        }
-        let jwk = jwk.ok_or(OidcError::InvalidSignature)?;
+        let jwk = self.jwks.key(&kid).await.map_err(|err| match err {
+            JwksError::Unavailable => OidcError::JwksUnavailable,
+            JwksError::UnknownKey => OidcError::InvalidSignature,
+        })?;
         let key = DecodingKey::from_jwk(&jwk).map_err(|_| OidcError::InvalidSignature)?;
 
         let mut validation = Validation::new(Algorithm::RS256);

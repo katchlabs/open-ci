@@ -4,8 +4,8 @@ use open_ci_core::admission::{
     AdmissionContext, evaluate_admission, evaluate_webhook_admission, requested_capacity,
 };
 use open_ci_core::config::{
-    AdmissionConfig, GitHubConfig, Guardrails, OidcTrustConfig, OpenCiConfig, Placement,
-    PoolConfig, ServerConfig,
+    AdmissionConfig, CacheServiceConfig, GitHubConfig, Guardrails, OidcTrustConfig, OpenCiConfig,
+    Placement, PoolConfig, ServerConfig,
 };
 use open_ci_core::models::{
     AdmissionMode, AdmissionReason, AdmissionRecord, AdmissionRequest, AdmissionStatus,
@@ -57,6 +57,7 @@ fn sample_config(max_vcpu: u32, max_instances: u32, max_disk: u32) -> OpenCiConf
             cloud_discovery_seconds: 60,
             prefer_cheapest: true,
             provider_weights: BTreeMap::new(),
+            transparent_cache: false,
             placements: vec![
                 mock_placement("us-west1", "us-west1-a", "n2d-standard-2", "subnet-a"),
                 mock_placement("us-east1", "us-east1-b", "c2d-standard-2", "subnet-b"),
@@ -525,4 +526,43 @@ fn example_toml_parses_and_validates() {
     let raw = include_str!("../../../config/open-ci.example.toml");
     let parsed = OpenCiConfig::parse_toml(raw);
     assert!(parsed.is_ok(), "example config failed: {parsed:?}");
+}
+
+#[test]
+fn workers_get_the_cache_url_only_when_their_pool_opts_in() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut cfg = sample_config(64, 16, 1_000);
+    let pool_id = cfg.pools.keys().next().cloned().ok_or("pool")?;
+    let pool = |cfg: &OpenCiConfig| cfg.pools.get(&pool_id).cloned().ok_or("pool");
+
+    assert_eq!(
+        cfg.worker_cache_url(&pool(&cfg)?),
+        None,
+        "no [cache] section"
+    );
+
+    cfg.cache = Some(toml::from_str::<CacheServiceConfig>(
+        "public_url = \"http://10.0.0.5:8090\"\n[auth]\nrepositories = [1]\n",
+    )?);
+    assert_eq!(
+        cfg.worker_cache_url(&pool(&cfg)?),
+        None,
+        "pool did not opt in"
+    );
+
+    if let Some(p) = cfg.pools.get_mut(&pool_id) {
+        p.transparent_cache = true;
+    }
+    assert_eq!(
+        cfg.worker_cache_url(&pool(&cfg)?),
+        Some("http://10.0.0.5:8090")
+    );
+    assert!(cfg.validate().is_ok());
+
+    cfg.cache = None;
+    assert!(
+        cfg.validate().is_err(),
+        "transparent_cache requires a [cache] section"
+    );
+    Ok(())
 }

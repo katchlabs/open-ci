@@ -6,6 +6,7 @@
 
 mod agent;
 mod commands;
+mod runner_redirect;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
