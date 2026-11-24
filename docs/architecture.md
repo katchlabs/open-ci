@@ -79,7 +79,7 @@ Workspace-wide lints in `Cargo.toml` enforce `unsafe_code = "forbid"`, `clippy::
 | `open-ci-provider-mock` | Deterministic test & demo provider | In-memory fault-injecting `MockProvider` supporting quota/stockout simulation, used in integration tests and `open-ci demo`. |
 | `open-ci-github` | GitHub integration & security | Bounded-pagination REST client supporting repo-level and org-level JIT registration (`runner_group_id`), constant-time HMAC-SHA256 webhook verification, RS256 OIDC JWT verifier with lock-free singleflight JWKS refresh, and privilege-separated `rotate_credentials` broker. |
 | `open-ci-server` | Control plane & HTTP server | Non-blocking `ControlPlane`, background reconciler (`scale_up`, `worker_lifecycle`, `orphans`), single-use HMAC bootstrap handler, public machine ingress, bearer-authenticated Operator API, SSE broadcast stream, and Prometheus metrics. |
-| `open-ci-cache` | Native Actions v2 cache server | Axum server implementing GitHub Actions Cache v2 Twirp RPCs and Azure-compatible single-shot/block blob endpoints, scoped HMAC-SHA256 bearer tokens, signed capability URLs, `LocalFsStorage` (NVMe + LRU eviction), and pure-Rust SigV4 `S3CompatibleStorage`. |
+| `open-ci-cache` | Native Actions v2 cache server | Axum server implementing GitHub Actions Cache v2 Twirp RPCs and Azure-compatible single-shot/block blob endpoints, runtime-token authorization with ref-scoped immutable entries, signed capability URLs, a `SQLite` index with retention, streaming `local`/`s3`/`gcs` `BlobStore` backends, and results-service passthrough. |
 | `open-ci-aws-janitor` | Independent AWS expiry guard | Standalone Rust CLI and AWS Lambda (`provided.al2023` custom runtime loop) sweeping expired `open-ci-managed=true` EC2 instances and detached EBS volumes with per-resource error isolation and fail-closed tag parsing. |
 | `open-ci-cli` | Thin CLI & worker agent binary | Subcommands: `serve`, `cache`, `demo`, `validate`, `ctl`, `backup`, `rotate-credentials`, `agent bootstrap`. |
 
@@ -187,14 +187,20 @@ stateDiagram-v2
 
 ### Transparent Cache (`open-ci-cache`)
 
-When `[cache]` is configured in `open-ci.toml` and `OPEN_CI_CACHE_SIGNING_KEY_FILE` is set:
+When `[cache]` is configured in `open-ci.toml` and `OPEN_CI_CACHE_SIGNING_KEY_FILE` is set for `open-ci cache`:
 
-1. During worker launch, `open-ci-server` mints a repository-scoped HMAC-SHA256 bearer token (`<base64url(claims)>.<hmac>`, TTL = `pool.lifetime_seconds`) and includes `cache_url` + `cache_token` in the worker's cloud-init stdin envelope.
-2. `open-ci agent bootstrap` injects `ACTIONS_CACHE_SERVICE_V2=true`, `ACTIONS_RESULTS_URL=<cache_url>`, and `OPEN_CI_CACHE_TOKEN=<cache_token>` into the official GitHub Actions runner process, along with `DOCKER_BUILDKIT=1` and `COMPOSE_DOCKER_CLI_BUILD=1`.
-3. Standard `actions/cache@v4`, `Swatinem/rust-cache@v2`, `actions/setup-node`, and Docker BuildKit `type=gha` talk to `open-ci cache` over the GitHub Actions Cache v2 Twirp protocol and Azure-compatible blob URLs.
-4. Storage backends:
-   - **`LocalFsStorage`** (`cache.storage_dir`): Local NVMe directory with atomic index persistence and LRU eviction bounded by `max_total_bytes` (default 50 GiB) and `max_entry_bytes` (default 10 GiB).
-   - **`S3CompatibleStorage`** (`cache.s3_endpoint` + `cache.s3_bucket`): Pure-Rust SigV4 client compatible with AWS S3, Cloudflare R2 (`s3_region = "auto"`), MinIO, and GCS S3-interop.
+1. For pools with `transparent_cache = true`, `open-ci-server` puts `cache_url` (= `cache.public_url`) in the worker's cloud-init stdin envelope. No cache credential is minted or shipped.
+2. `open-ci agent bootstrap` renames the `ACTIONS_RESULTS_URL` UTF-16 literal in the runner's `bin/Runner.Worker.dll` to `ACTIONS_RESULTS_ORL` (same length), so the runner stops overwriting it per job, then starts the runner with `ACTIONS_CACHE_SERVICE_V2=true` and `ACTIONS_RESULTS_URL=<cache_url>/`. If the runner build lacks the literal, the agent skips the redirect and jobs keep GitHub's cache.
+   **Limitation:** the runner forwards only its per-step environment into `container:` jobs and Docker container actions, so inside those containers `ACTIONS_RESULTS_URL` is absent once redirected (artifact uploads and caching fail there). Enable `transparent_cache` only on pools whose jobs run steps on the VM itself.
+3. Official `actions/cache`, `setup-*` caching, `Swatinem/rust-cache`, and BuildKit `type=gha` call `open-ci cache` with the job's own `ACTIONS_RUNTIME_TOKEN`. The server verifies it (RS256 via the issuer JWKS, `iss`, `exp`, optional `aud`), requires its `repository_id` to be in `cache.auth.repositories`, and reads its `ac` ref grants.
+4. Entries are immutable and keyed by `(repository_id, ref scope, version, key)`, exactly like GitHub: a job saves only into its writable ref (a PR writes `refs/pull/N/merge`, never `main`) and restores from its own ref first, then the read-only base/default refs; per ref it tries each key exact, then newest prefix. A duplicate save returns `409`.
+5. Every other Twirp call (for example `ArtifactService`, used by `upload-artifact@v4`) is forwarded unchanged to `cache.upstream_results_url` (`https://results-receiver.actions.githubusercontent.com` by default).
+6. Metadata lives in a `SQLite` index (`cache.index_path`). Archives stream through a pluggable `BlobStore`; nothing buffers whole archives in memory:
+   - **`local`** — local disk/NVMe directory with atomic `0o600` writes.
+   - **`s3`** — native SigV4 S3 API (AWS S3, R2, MinIO). Credentials: `instance` (IMDSv2 role, default), `environment`, or `assume_role`. Staged blocks are joined server-side with multipart `UploadPartCopy`. Add an `AbortIncompleteMultipartUpload` bucket lifecycle rule so uploads interrupted by a crash are reclaimed. R2 requires equal-sized parts, which holds for the toolkit's uniform block size but not for clients that stage uneven blocks.
+   - **`gcs`** — native GCS JSON API. Credentials: `metadata` (VM service account, default), `impersonate`, or `token_file`. Staged blocks are joined server-side with `compose`.
+7. Upload URLs accept bytes only while their reservation is live: after finalize (or once a reservation goes stale) every `PUT` is rejected, so a committed entry can never be rewritten. Block commits run to completion even if the client disconnects, block lists are capped at Azure's 50,000 blocks, and storage requests fail after 60 s without progress instead of hanging.
+8. A background sweep (every `cache.retention.sweep_interval_seconds` and after each save) drops stale upload reservations, entries unused for `max_unused_days` (default 7, like GitHub), then least-recently-used entries until the total fits `max_total_bytes`, deleting their blobs.
 
 ### Boot-Time Auto-NVMe & Kernel Tuning (`infra/packer`)
 
@@ -248,12 +254,13 @@ Runs via `open-ci cache --config /etc/open-ci/open-ci.toml` on private runner-re
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
 | `GET` | `/healthz` | None | Liveness probe returning `200 OK` (`ok`). |
-| `POST` | `/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry` | `Authorization: Bearer <scoped HMAC token>` | Registers a pending upload for `(scope, key, version)` and returns a time-bounded signed upload URL (`1 MiB` JSON limit). |
-| `POST` | `/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload` | `Authorization: Bearer <scoped HMAC token>` | Verifies blob presence and `max_entry_bytes`, commits entry to index, and cleans up any replaced blob. |
-| `POST` | `/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL` | `Authorization: Bearer <scoped HMAC token>` | Resolves exact `key` or up to 64 `restore_keys` prefixes within token `scope`, updates LRU timestamp, and returns a signed download URL. |
-| `PUT` | `/v1/cache/blobs/{id}` | Signed query (`exp`, `op=put`, `sig`) | Supports single-shot upload (no `comp`), Azure staged block upload (`?comp=block&blockid=<id>`), and Azure XML blocklist commit (`?comp=blocklist`). |
+| `POST` | `/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry` | `Authorization: Bearer <ACTIONS_RUNTIME_TOKEN>` | Reserves `(repository, writable ref, version, key)` and returns a signed upload URL; `409` if the entry exists or another upload holds it, `403` without a writable ref (`1 MiB` JSON limit). |
+| `POST` | `/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload` | `Authorization: Bearer <ACTIONS_RUNTIME_TOKEN>` | Verifies the uploaded size against `sizeBytes` and `max_entry_bytes`, then publishes the immutable entry. |
+| `POST` | `/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL` | `Authorization: Bearer <ACTIONS_RUNTIME_TOKEN>` | Searches the token's readable refs in order (exact then newest prefix per key, up to 64 restore keys) and returns a signed download URL or a miss. |
+| `POST` | `/twirp/{service}/{method}` | Forwarded unchanged | Any non-`CacheService` Twirp call is proxied to `cache.upstream_results_url`; unknown `CacheService` methods return `404`. |
+| `PUT` | `/v1/cache/blobs/{id}` | Signed query (`exp`, `op=put`, `sig`) | Single-shot upload (no `comp`), Azure staged block upload (`?comp=block&blockid=<id>`), or Azure XML blocklist commit (`?comp=blocklist`). `Content-Length` is required and enforced. |
 | `HEAD` | `/v1/cache/blobs/{id}` | Signed query (`exp`, `op=get`, `sig`) | Returns `Content-Length` and `Accept-Ranges: bytes`. |
-| `GET` | `/v1/cache/blobs/{id}` | Signed query (`exp`, `op=get`, `sig`) | Streams blob in 64 KiB chunks; supports HTTP `Range: bytes=...` (`206 Partial Content`). |
+| `GET` | `/v1/cache/blobs/{id}` | Signed query (`exp`, `op=get`, `sig`) | Streams the blob from storage; supports single `Range: bytes=...` (`206 Partial Content`). |
 
 ---
 
@@ -280,8 +287,8 @@ Runs via `open-ci cache --config /etc/open-ci/open-ci.toml` on private runner-re
 | `OPEN_CI_WEBHOOK_SECRET_FILE` | `serve` | Path to GitHub webhook secret (>= 32 bytes, required). |
 | `OPEN_CI_BOOTSTRAP_SECRET_FILE` | `serve` | Path to HMAC master secret for worker bootstrap/usage tokens (>= 32 bytes, required). |
 | `OPEN_CI_OPERATOR_TOKEN_FILE` | `serve` | Path to Operator API bearer token (>= 24 bytes; optional, enables `/api/v1/*` and `/metrics`). |
-| `OPEN_CI_CACHE_SIGNING_KEY_FILE` | `serve`, `cache` | Path to shared HMAC-SHA256 key (>= 32 bytes) for cache tokens and signed blob URLs. |
+| `OPEN_CI_CACHE_SIGNING_KEY_FILE` | `cache` | Path to the HMAC-SHA256 key (>= 32 bytes) for signed blob URLs. |
 | `OPEN_CI_GCP_TOKEN_FILE` | `serve` | Optional path to rotated GCP OAuth2 token file (falls back to GCE metadata server if unset). |
-| `OPEN_CI_CACHE_S3_ACCESS_KEY_ID` / `OPEN_CI_CACHE_S3_SECRET_ACCESS_KEY` / `OPEN_CI_CACHE_S3_SESSION_TOKEN` | `cache` | S3/R2/MinIO credentials (falls back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`). |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | `cache` | Static S3/R2/MinIO credentials, read only when `cache.storage.credentials.type = "environment"`. |
 | `OPEN_CI_URL` / `OPEN_CI_OPERATOR_TOKEN` | `ctl` | Target control-plane URL and bearer token for `open-ci ctl`. |
 | `OPEN_CI_RUNNER_USER` / `OPEN_CI_CACHE_URL` / `OPEN_CI_AGENT_NO_POWEROFF` | `agent bootstrap` | Optional overrides for non-root runner OS user (`runner`), fallback cache URL, or disabling VM poweroff in local tests. |

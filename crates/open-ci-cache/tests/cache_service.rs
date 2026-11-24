@@ -1,467 +1,672 @@
-//! Integration tests for the GitHub Actions v2 Twirp Cache Service protocol and security controls.
+//! Cache Service v2 over HTTP with real RS256 runtime tokens, a local blob store, and `SQLite`.
 
 use axum::Router;
-use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, header};
-use open_ci_cache::{CacheConfig, CacheServer, LocalFsStorage, issue_cache_token};
-use open_ci_core::{Clock, ManualClock, SecretString};
+use axum::body::{Body, Bytes, to_bytes};
+use axum::extract::State;
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use axum::routing::post;
+use open_ci_cache::{
+    BlobStore, CacheConfig, CacheIndex, CacheServer, LocalBlobStore, RetentionPolicy,
+};
+use open_ci_core::config::RepositoryAllowlist;
+use open_ci_core::{Clock, ManualClock, SecretString, SystemClock};
+use open_ci_github::test_issuer::TestIssuer;
+use open_ci_github::{RuntimeTokenPolicy, RuntimeTokenVerifier};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const BASE_URL: &str = "http://cache.internal:8090";
-const SIGNING_KEY: &str = "super-secret-signing-key-for-tests";
-const CREATE_URL: &str = "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry";
-const FINALIZE_URL: &str =
-    "/twirp/github.actions.results.api.v1.CacheService/FinalizeCacheEntryUpload";
-const DOWNLOAD_URL: &str =
-    "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL";
+const SERVICE: &str = "/twirp/github.actions.results.api.v1.CacheService";
+const REPO: u64 = 1001;
+const MAIN: &str = "refs/heads/main";
+const PR: &str = "refs/pull/12/merge";
+const PUSH_TO_MAIN: &[(&str, u32)] = &[(MAIN, 3)];
+const PULL_REQUEST: &[(&str, u32)] = &[(MAIN, 1), (PR, 3)];
+const READ_ONLY: &[(&str, u32)] = &[(MAIN, 1)];
 
-async fn make_test_server(
-    dir: &TempDir,
+struct Harness {
+    app: Router,
+    server: CacheServer,
+    issuer: TestIssuer,
     clock: Arc<ManualClock>,
+    store: Arc<LocalBlobStore>,
+    _dir: TempDir,
+}
+
+struct Options {
     max_entry_bytes: u64,
     max_total_bytes: u64,
-) -> Result<CacheServer, Box<dyn std::error::Error>> {
-    let mut cfg = CacheConfig::local_fs(
-        BASE_URL,
-        SecretString::new(SIGNING_KEY),
-        dir.path().to_path_buf(),
-    );
-    cfg.max_entry_bytes = max_entry_bytes;
-    cfg.max_total_bytes = max_total_bytes;
-    cfg.signed_url_ttl_seconds = 300;
-    let storage = Arc::new(
-        LocalFsStorage::open_with_clock(dir.path().to_path_buf(), max_total_bytes, clock.clone())
-            .await?,
-    );
-    Ok(CacheServer::with_storage(cfg, storage, clock).await?)
+    upstream: String,
 }
 
-async fn send_json(
-    app: &Router,
-    uri: &str,
-    bearer: Option<&str>,
-    payload: &Value,
-) -> Result<(StatusCode, Value), Box<dyn std::error::Error>> {
-    let mut builder = Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(tok) = bearer {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {tok}"));
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            max_entry_bytes: 64 * 1024 * 1024,
+            max_total_bytes: 1024 * 1024 * 1024,
+            upstream: "http://127.0.0.1:9".to_owned(),
+        }
     }
-    let req = builder.body(Body::from(serde_json::to_vec(payload)?))?;
-    let resp = app.clone().oneshot(req).await?;
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 2 * 1024 * 1024).await?;
-    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    Ok((status, parsed))
 }
 
-async fn send_put(
-    app: &Router,
-    uri: &str,
-    body: impl Into<Body>,
-) -> Result<StatusCode, Box<dyn std::error::Error>> {
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri(uri)
-        .body(body.into())?;
-    Ok(app.clone().oneshot(req).await?.status())
+async fn harness(options: Options) -> AnyResult<Harness> {
+    let dir = TempDir::new()?;
+    let issuer = TestIssuer::start().await?;
+    let clock = Arc::new(ManualClock::new(SystemClock.now_unix()));
+    let store = Arc::new(LocalBlobStore::open(dir.path().join("blobs")).await?);
+    let index = CacheIndex::open(&dir.path().join("index.db")).await?;
+    let verifier = RuntimeTokenVerifier::new(
+        RuntimeTokenPolicy {
+            issuer: issuer.issuer().to_owned(),
+            jwks_url: None,
+            audience: None,
+            repositories: RepositoryAllowlist::Ids(BTreeSet::from([REPO])),
+        },
+        reqwest::Client::new(),
+    );
+    let config = CacheConfig {
+        listen_addr: "127.0.0.1:0".to_owned(),
+        public_base_url: BASE_URL.to_owned(),
+        signing_key: SecretString::new("s".repeat(32)),
+        max_entry_bytes: options.max_entry_bytes,
+        signed_url_ttl_seconds: 300,
+        upstream_results_url: options.upstream,
+        retention: RetentionPolicy {
+            max_total_bytes: options.max_total_bytes,
+            max_unused_days: 7,
+        },
+        sweep_interval: Duration::from_secs(300),
+    };
+    let server = CacheServer::new(config, store.clone(), index, verifier, clock.clone())?;
+    Ok(Harness {
+        app: server.router(),
+        server,
+        issuer,
+        clock,
+        store,
+        _dir: dir,
+    })
 }
 
-fn strip_base_url(signed_url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    signed_url
+impl Harness {
+    fn token(&self, grants: &[(&str, u32)]) -> AnyResult<String> {
+        Ok(self.issuer.runtime_token(REPO, grants)?)
+    }
+
+    async fn rpc(
+        &self,
+        method: &str,
+        token: Option<&str>,
+        body: &Value,
+    ) -> AnyResult<(StatusCode, Value)> {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{SERVICE}/{method}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = self
+            .app
+            .clone()
+            .oneshot(request.body(Body::from(serde_json::to_vec(body)?))?)
+            .await?;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+        Ok((
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        ))
+    }
+
+    async fn put(&self, url: &str, data: Bytes) -> AnyResult<StatusCode> {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri(path_of(url)?)
+            .header(header::CONTENT_LENGTH, data.len())
+            .body(Body::from(data))?;
+        Ok(self.app.clone().oneshot(request).await?.status())
+    }
+
+    async fn get(
+        &self,
+        url: &str,
+        range: Option<&str>,
+    ) -> AnyResult<(StatusCode, HeaderMap, Bytes)> {
+        let mut request = Request::builder().method(Method::GET).uri(path_of(url)?);
+        if let Some(range) = range {
+            request = request.header(header::RANGE, range);
+        }
+        let response = self
+            .app
+            .clone()
+            .oneshot(request.body(Body::empty())?)
+            .await?;
+        let (status, headers) = (response.status(), response.headers().clone());
+        Ok((
+            status,
+            headers,
+            to_bytes(response.into_body(), usize::MAX).await?,
+        ))
+    }
+
+    /// Saves like the Azure SDK: staged blocks, then a block list, then finalize.
+    async fn save(&self, token: &str, key: &str, data: &[u8]) -> AnyResult<StatusCode> {
+        let (status, created) = self
+            .rpc(
+                "CreateCacheEntry",
+                Some(token),
+                &json!({"key": key, "version": "v1"}),
+            )
+            .await?;
+        if status != StatusCode::OK {
+            return Ok(status);
+        }
+        let upload_url = created["signed_upload_url"].as_str().ok_or("upload url")?;
+        let mut block_list = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>");
+        for (i, chunk) in data.chunks(1024).enumerate() {
+            let block = format!("YmxvY2st{i:04}");
+            let status = self
+                .put(
+                    &format!("{upload_url}&comp=block&blockid={block}"),
+                    Bytes::copy_from_slice(chunk),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::CREATED);
+            block_list += &["<Latest>", &block, "</Latest>"].concat();
+        }
+        block_list.push_str("</BlockList>");
+        let status = self
+            .put(
+                &format!("{upload_url}&comp=blocklist"),
+                Bytes::from(block_list),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = self
+            .rpc(
+                "FinalizeCacheEntryUpload",
+                Some(token),
+                &json!({"key": key, "version": "v1", "sizeBytes": data.len().to_string()}),
+            )
+            .await?;
+        Ok(status)
+    }
+
+    async fn restore(
+        &self,
+        token: &str,
+        key: &str,
+        restore_keys: &[&str],
+    ) -> AnyResult<Option<(String, Bytes)>> {
+        let (status, found) = self
+            .rpc(
+                "GetCacheEntryDownloadURL",
+                Some(token),
+                &json!({"key": key, "restoreKeys": restore_keys, "version": "v1"}),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        if found["ok"] != json!(true) {
+            return Ok(None);
+        }
+        let url = found["signed_download_url"]
+            .as_str()
+            .ok_or("download url")?;
+        let (status, _, body) = self.get(url, None).await?;
+        assert_eq!(status, StatusCode::OK);
+        Ok(Some((
+            found["matched_key"]
+                .as_str()
+                .ok_or("matched key")?
+                .to_owned(),
+            body,
+        )))
+    }
+}
+
+fn path_of(url: &str) -> AnyResult<String> {
+    Ok(url
         .strip_prefix(BASE_URL)
-        .map(str::to_owned)
-        .ok_or_else(|| format!("unexpected base url in {signed_url}").into())
+        .ok_or("url not on cache origin")?
+        .to_owned())
 }
 
-async fn upload_single_shot(
-    app: &Router,
-    token: &str,
-    key: &str,
-    version: &str,
-    payload: &'static [u8],
-) -> TestResult {
-    let (status, created) = send_json(
-        app,
-        CREATE_URL,
-        Some(token),
-        &json!({ "key": key, "version": version }),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    let upload_path = strip_base_url(
-        created["signed_upload_url"]
-            .as_str()
-            .ok_or("missing signed_upload_url")?,
-    )?;
+fn archive(len: usize, seed: u8) -> Vec<u8> {
+    (0..=250u8)
+        .cycle()
+        .take(len)
+        .map(|b| seed.wrapping_add(b))
+        .collect()
+}
+
+#[tokio::test]
+async fn chunked_save_then_exact_and_ranged_restore_roundtrip() -> TestResult {
+    let h = harness(Options::default()).await?;
+    let push = h.token(PUSH_TO_MAIN)?;
+    let data = archive(5000, 3);
     assert_eq!(
-        send_put(app, &upload_path, payload).await?,
-        StatusCode::CREATED
+        h.save(&push, "deps-linux-abc", &data).await?,
+        StatusCode::OK
     );
-    let (fin_status, fin) = send_json(
-        app,
-        FINALIZE_URL,
-        Some(token),
-        &json!({ "key": key, "version": version, "size_bytes": payload.len() }),
-    )
-    .await?;
-    assert_eq!(fin_status, StatusCode::OK);
-    assert_eq!(fin["ok"], true);
+
+    let restored = h.restore(&push, "deps-linux-abc", &[]).await?;
+    assert_eq!(
+        restored,
+        Some(("deps-linux-abc".to_owned(), Bytes::from(data.clone())))
+    );
+
+    let (_, found) = h
+        .rpc(
+            "GetCacheEntryDownloadURL",
+            Some(&push),
+            &json!({"key": "deps-linux-abc", "version": "v1"}),
+        )
+        .await?;
+    let url = found["signed_download_url"].as_str().ok_or("url")?;
+    let (status, headers, body) = h.get(url, Some("bytes=100-199")).await?;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(headers[header::CONTENT_RANGE], "bytes 100-199/5000");
+    assert_eq!(body, Bytes::copy_from_slice(&data[100..200]));
     Ok(())
 }
 
 #[tokio::test]
-async fn twirp_azure_chunked_upload_exact_hit_head_get_and_range() -> TestResult {
-    let dir = TempDir::new()?;
-    let clock = Arc::new(ManualClock::new(1_700_000_000));
-    let server = make_test_server(&dir, clock.clone(), 1024 * 1024, 10 * 1024 * 1024).await?;
-    let app = server.router();
-    let token = issue_cache_token(
-        &SecretString::new(SIGNING_KEY),
-        "acme/repo-a",
-        3600,
-        clock.now_unix(),
-    )?;
+async fn pull_requests_read_base_ref_but_write_only_their_own_ref() -> TestResult {
+    let h = harness(Options::default()).await?;
+    let push = h.token(PUSH_TO_MAIN)?;
+    let pr = h.token(PULL_REQUEST)?;
+    let main_data = archive(2000, 1);
+    assert_eq!(h.save(&push, "deps-abc", &main_data).await?, StatusCode::OK);
 
-    let health = app
-        .clone()
-        .oneshot(Request::builder().uri("/healthz").body(Body::empty())?)
-        .await?;
-    assert_eq!(health.status(), StatusCode::OK);
-
-    let (status, created) = send_json(
-        &app,
-        CREATE_URL,
-        Some(&token),
-        &json!({ "key": "linux-cargo-old", "version": "v1" }),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(created["ok"], true);
-    let upload_path = strip_base_url(
-        created["signed_upload_url"]
-            .as_str()
-            .ok_or("missing signed_upload_url")?,
-    )?;
-
+    let from_pr = h.restore(&pr, "deps-abc", &[]).await?;
     assert_eq!(
-        send_put(
-            &app,
-            &format!("{upload_path}&comp=block&blockid=AAAA"),
-            "hello "
-        )
-        .await?,
-        StatusCode::CREATED
-    );
-    assert_eq!(
-        send_put(
-            &app,
-            &format!("{upload_path}&comp=block&blockid=AAAB"),
-            "open-ci-cache!"
-        )
-        .await?,
-        StatusCode::CREATED
-    );
-    let xml = r#"<?xml version="1.0" encoding="utf-8"?><BlockList><Latest>AAAA</Latest><Latest>AAAB</Latest></BlockList>"#;
-    assert_eq!(
-        send_put(&app, &format!("{upload_path}&comp=blocklist"), xml).await?,
-        StatusCode::CREATED
+        from_pr.map(|(_, body)| body),
+        Some(Bytes::from(main_data.clone())),
+        "PR falls back to main"
     );
 
-    let (fin_status, finalized) = send_json(
-        &app,
-        FINALIZE_URL,
-        Some(&token),
-        &json!({ "key": "linux-cargo-old", "version": "v1", "size_bytes": "20" }),
-    )
-    .await?;
-    assert_eq!(fin_status, StatusCode::OK);
-    assert_eq!(finalized["ok"], true);
-    assert!(
-        finalized["entry_id"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty())
-    );
-
-    let (hit_status, hit) = send_json(
-        &app,
-        DOWNLOAD_URL,
-        Some(&token),
-        &json!({ "key": "linux-cargo-old", "restore_keys": ["linux-cargo-"], "version": "v1" }),
-    )
-    .await?;
-    assert_eq!(hit_status, StatusCode::OK);
-    assert_eq!(hit["ok"], true);
-    assert_eq!(hit["matched_key"], "linux-cargo-old");
-    let download_path = strip_base_url(
-        hit["signed_download_url"]
-            .as_str()
-            .ok_or("missing signed_download_url")?,
-    )?;
-    verify_download_head_get_and_range(&app, &download_path).await
-}
-
-async fn verify_download_head_get_and_range(app: &Router, download_path: &str) -> TestResult {
-    let head_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::HEAD)
-                .uri(download_path)
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(head_resp.status(), StatusCode::OK);
+    let poisoned = archive(2000, 99);
     assert_eq!(
-        head_resp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok()),
-        Some("20")
+        h.save(&pr, "deps-abc", &poisoned).await?,
+        StatusCode::OK,
+        "PR saves into its own ref"
     );
-
-    let get_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(download_path)
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(get_resp.status(), StatusCode::OK);
     assert_eq!(
-        &axum::body::to_bytes(get_resp.into_body(), 1024).await?[..],
-        b"hello open-ci-cache!"
+        h.restore(&push, "deps-abc", &[])
+            .await?
+            .map(|(_, body)| body),
+        Some(Bytes::from(main_data)),
+        "main never sees the PR's entry"
     );
-
-    let range_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(download_path)
-                .header(header::RANGE, "bytes=6-12")
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(range_resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(
-        &axum::body::to_bytes(range_resp.into_body(), 1024).await?[..],
-        b"open-ci"
+        h.restore(&pr, "deps-abc", &[]).await?.map(|(_, body)| body),
+        Some(Bytes::from(poisoned)),
+        "the PR prefers its own ref"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn restore_keys_prefix_selects_newest_handles_miss_and_persists_across_restart() -> TestResult
-{
-    let dir = TempDir::new()?;
-    let clock = Arc::new(ManualClock::new(1_700_000_000));
-    let server = make_test_server(&dir, clock.clone(), 1024 * 1024, 10 * 1024 * 1024).await?;
-    let app = server.router();
-    let token = issue_cache_token(
-        &SecretString::new(SIGNING_KEY),
-        "acme/repo-a",
-        3600,
-        clock.now_unix(),
-    )?;
-
-    upload_single_shot(&app, &token, "linux-cargo-1", "v1", b"older-cache").await?;
-    clock.advance(60);
-    upload_single_shot(&app, &token, "linux-cargo-2", "v1", b"newer-cache").await?;
-
-    let (status, prefix_hit) = send_json(
-        &app,
-        DOWNLOAD_URL,
-        Some(&token),
-        &json!({
-            "key": "linux-cargo-missing",
-            "restore_keys": ["linux-cargo-"],
-            "version": "v1"
-        }),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(prefix_hit["ok"], true);
-    assert_eq!(prefix_hit["matched_key"], "linux-cargo-2");
-
-    let (miss_status, miss) = send_json(
-        &app,
-        DOWNLOAD_URL,
-        Some(&token),
-        &json!({
-            "key": "linux-cargo-2",
-            "restore_keys": ["linux-cargo-"],
-            "version": "v2-other"
-        }),
-    )
-    .await?;
-    assert_eq!(miss_status, StatusCode::OK);
-    assert_eq!(miss["ok"], false);
-    assert!(miss.get("signed_download_url").is_none());
-
-    let reloaded = make_test_server(&dir, clock.clone(), 1024 * 1024, 10 * 1024 * 1024).await?;
-    let (restart_status, after_restart) = send_json(
-        &reloaded.router(),
-        DOWNLOAD_URL,
-        Some(&token),
-        &json!({ "key": "linux-cargo-1", "restore_keys": [], "version": "v1" }),
-    )
-    .await?;
-    assert_eq!(restart_status, StatusCode::OK);
-    assert_eq!(after_restart["ok"], true);
-    assert_eq!(after_restart["matched_key"], "linux-cargo-1");
-    Ok(())
-}
-
-#[tokio::test]
-async fn security_cross_scope_isolation_and_token_or_url_expiry_and_tampering() -> TestResult {
-    let dir = TempDir::new()?;
-    let clock = Arc::new(ManualClock::new(1_700_000_000));
-    let server = make_test_server(&dir, clock.clone(), 1024, 4096).await?;
-    let app = server.router();
-    let key = SecretString::new(SIGNING_KEY);
-
-    let token_a = issue_cache_token(&key, "org/repo-a", 120, clock.now_unix())?;
-    let token_b = issue_cache_token(&key, "org/repo-b", 120, clock.now_unix())?;
-    upload_single_shot(&app, &token_a, "shared-key", "v1", b"repo-a-secret").await?;
-
-    // Cross-scope isolation: repo-b cannot see repo-a's entry
-    let (status, other_lookup) = send_json(
-        &app,
-        DOWNLOAD_URL,
-        Some(&token_b),
-        &json!({ "key": "shared-key", "restore_keys": ["shared-"], "version": "v1" }),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(other_lookup["ok"], false);
-
-    // Signed download URL tampering and operation confusion
-    let (_, owner_lookup) = send_json(
-        &app,
-        DOWNLOAD_URL,
-        Some(&token_a),
-        &json!({ "key": "shared-key", "restore_keys": [], "version": "v1" }),
-    )
-    .await?;
-    let download_path = strip_base_url(
-        owner_lookup["signed_download_url"]
-            .as_str()
-            .ok_or("missing signed_download_url")?,
-    )?;
-
-    let tampered = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(format!("{download_path}dead"))
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(tampered.status(), StatusCode::FORBIDDEN);
+async fn entries_are_immutable_and_require_write_permission() -> TestResult {
+    let h = harness(Options::default()).await?;
+    let push = h.token(PUSH_TO_MAIN)?;
     assert_eq!(
-        send_put(&app, &download_path, "poison").await?,
+        h.save(&push, "deps", &archive(10, 1)).await?,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.save(&push, "deps", &archive(10, 2)).await?,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        h.save(&h.token(READ_ONLY)?, "other", &archive(10, 1))
+            .await?,
         StatusCode::FORBIDDEN
     );
-
-    // Expired bearer token -> 401
-    clock.advance(200);
-    let (expired_token_status, _) = send_json(
-        &app,
-        DOWNLOAD_URL,
-        Some(&token_a),
-        &json!({ "key": "shared-key", "restore_keys": [], "version": "v1" }),
-    )
-    .await?;
-    assert_eq!(expired_token_status, StatusCode::UNAUTHORIZED);
-
-    // Expired signed URL -> 403
-    clock.advance(200);
-    let expired_dl = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(&download_path)
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(expired_dl.status(), StatusCode::FORBIDDEN);
     Ok(())
 }
 
 #[tokio::test]
-async fn security_rejects_oversized_single_and_chunked_uploads_and_tampered_put_sig() -> TestResult
-{
-    let dir = TempDir::new()?;
-    let clock = Arc::new(ManualClock::new(1_700_000_000));
-    let server = make_test_server(&dir, clock.clone(), 64, 4096).await?;
-    let app = server.router();
-    let token = issue_cache_token(
-        &SecretString::new(SIGNING_KEY),
-        "org/repo-a",
-        300,
-        clock.now_unix(),
-    )?;
-
-    let (_, created) = send_json(
-        &app,
-        CREATE_URL,
-        Some(&token),
-        &json!({ "key": "big-blob", "version": "v1" }),
-    )
-    .await?;
-    let upload_path = strip_base_url(
-        created["signed_upload_url"]
-            .as_str()
-            .ok_or("missing signed_upload_url")?,
-    )?;
-
-    // Tampered upload URL signature rejected
+async fn untrusted_tokens_are_rejected() -> TestResult {
+    let h = harness(Options::default()).await?;
+    let body = json!({"key": "k", "version": "v1"});
     assert_eq!(
-        send_put(&app, &format!("{upload_path}ff"), "tiny").await?,
+        h.rpc("CreateCacheEntry", None, &body).await?.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        h.rpc("CreateCacheEntry", Some("garbage"), &body).await?.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let foreign = h.issuer.runtime_token(REPO + 1, PUSH_TO_MAIN)?;
+    assert_eq!(
+        h.rpc("CreateCacheEntry", Some(&foreign), &body).await?.0,
         StatusCode::FORBIDDEN
     );
-
-    // Oversized single-shot upload rejected with 413
+    let other_issuer = TestIssuer::start().await?;
+    let wrong_issuer = other_issuer.runtime_token(REPO, PUSH_TO_MAIN)?;
     assert_eq!(
-        send_put(&app, &upload_path, vec![b'x'; 65]).await?,
-        StatusCode::PAYLOAD_TOO_LARGE
+        h.rpc("CreateCacheEntry", Some(&wrong_issuer), &body)
+            .await?
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn finalize_rejects_missing_and_mismatched_uploads_without_publishing() -> TestResult {
+    let h = harness(Options::default()).await?;
+    let push = h.token(PUSH_TO_MAIN)?;
+    let finalize = |size: &str| json!({"key": "k", "version": "v1", "sizeBytes": size});
+
+    assert_eq!(
+        h.rpc("FinalizeCacheEntryUpload", Some(&push), &finalize("1"))
+            .await?
+            .0,
+        StatusCode::NOT_FOUND
     );
 
-    // Oversized assembled chunked upload rejected with 413
-    assert_eq!(
-        send_put(
-            &app,
-            &format!("{upload_path}&comp=block&blockid=B1"),
-            vec![b'a'; 40]
+    let (_, created) = h
+        .rpc(
+            "CreateCacheEntry",
+            Some(&push),
+            &json!({"key": "k", "version": "v1"}),
         )
-        .await?,
+        .await?;
+    let url = created["signed_upload_url"].as_str().ok_or("url")?;
+    assert_eq!(
+        h.put(url, Bytes::from(archive(100, 1))).await?,
         StatusCode::CREATED
     );
     assert_eq!(
-        send_put(
-            &app,
-            &format!("{upload_path}&comp=block&blockid=B2"),
-            vec![b'b'; 40]
+        h.rpc("FinalizeCacheEntryUpload", Some(&push), &finalize("99"))
+            .await?
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(h.restore(&push, "k", &[]).await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn signed_urls_are_bound_to_operation_and_expire() -> TestResult {
+    let h = harness(Options::default()).await?;
+    let push = h.token(PUSH_TO_MAIN)?;
+    let (_, created) = h
+        .rpc(
+            "CreateCacheEntry",
+            Some(&push),
+            &json!({"key": "k", "version": "v1"}),
         )
-        .await?,
+        .await?;
+    let upload = created["signed_upload_url"]
+        .as_str()
+        .ok_or("url")?
+        .to_owned();
+
+    let tampered = upload.replace("sig=", "sig=00");
+    assert_eq!(
+        h.put(&tampered, Bytes::from_static(b"x")).await?,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        h.get(&upload, None).await?.0,
+        StatusCode::FORBIDDEN,
+        "an upload URL cannot download"
+    );
+
+    h.clock.advance(301);
+    assert_eq!(
+        h.put(&upload, Bytes::from_static(b"x")).await?,
+        StatusCode::FORBIDDEN
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_urls_stop_accepting_bytes_once_finalized_or_abandoned() -> TestResult {
+    let h = harness(Options::default()).await?;
+    let push = h.token(PUSH_TO_MAIN)?;
+    let create = json!({"key": "deps", "version": "v1"});
+
+    let (_, created) = h.rpc("CreateCacheEntry", Some(&push), &create).await?;
+    let url = created["signed_upload_url"]
+        .as_str()
+        .ok_or("url")?
+        .to_owned();
+    assert_eq!(
+        h.put(&url, Bytes::from_static(b"original")).await?,
         StatusCode::CREATED
     );
-    let xml = "<BlockList><Latest>B1</Latest><Latest>B2</Latest></BlockList>";
+    let finalize = json!({"key": "deps", "version": "v1", "sizeBytes": "8"});
     assert_eq!(
-        send_put(&app, &format!("{upload_path}&comp=blocklist"), xml).await?,
+        h.rpc("FinalizeCacheEntryUpload", Some(&push), &finalize)
+            .await?
+            .0,
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        h.put(&url, Bytes::from_static(b"POISONED")).await?,
+        StatusCode::FORBIDDEN,
+        "a finalized entry cannot be rewritten through its upload URL"
+    );
+    assert_eq!(
+        h.put(
+            &format!("{url}&comp=block&blockid=YQ=="),
+            Bytes::from_static(b"x")
+        )
+        .await?,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        h.restore(&push, "deps", &[]).await?.map(|(_, body)| body),
+        Some(Bytes::from_static(b"original"))
+    );
+
+    let other = json!({"key": "never-uploaded", "version": "v1"});
+    let (_, created) = h.rpc("CreateCacheEntry", Some(&push), &other).await?;
+    let abandoned = created["signed_upload_url"]
+        .as_str()
+        .ok_or("url")?
+        .to_owned();
+    let finalize = json!({"key": "never-uploaded", "version": "v1"});
+    assert_eq!(
+        h.rpc("FinalizeCacheEntryUpload", Some(&push), &finalize)
+            .await?
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        h.put(&abandoned, Bytes::from_static(b"late")).await?,
+        StatusCode::FORBIDDEN,
+        "an upload whose reservation was consumed cannot leak bytes into storage"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn uploads_require_bounded_declared_length() -> TestResult {
+    let h = harness(Options {
+        max_entry_bytes: 1000,
+        max_total_bytes: 10_000,
+        ..Options::default()
+    })
+    .await?;
+    let push = h.token(PUSH_TO_MAIN)?;
+    let (_, created) = h
+        .rpc(
+            "CreateCacheEntry",
+            Some(&push),
+            &json!({"key": "k", "version": "v1"}),
+        )
+        .await?;
+    let url = created["signed_upload_url"].as_str().ok_or("url")?;
+
+    let without_length = Request::builder()
+        .method(Method::PUT)
+        .uri(path_of(url)?)
+        .body(Body::from_stream(futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))
+        })))?;
+    assert_eq!(
+        h.app.clone().oneshot(without_length).await?.status(),
+        StatusCode::LENGTH_REQUIRED
+    );
+    assert_eq!(
+        h.put(url, Bytes::from(archive(1001, 1))).await?,
         StatusCode::PAYLOAD_TOO_LARGE
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retention_evicts_least_recently_used_entries_and_their_blobs() -> TestResult {
+    let h = harness(Options {
+        max_entry_bytes: 1000,
+        max_total_bytes: 1000,
+        ..Options::default()
+    })
+    .await?;
+    let push = h.token(PUSH_TO_MAIN)?;
+    assert_eq!(
+        h.save(&push, "old", &archive(600, 1)).await?,
+        StatusCode::OK
+    );
+    h.clock.advance(10);
+    assert_eq!(
+        h.save(&push, "new", &archive(600, 2)).await?,
+        StatusCode::OK
+    );
+
+    assert_eq!(h.server.sweep().await?, 1);
+    assert_eq!(h.restore(&push, "old", &[]).await?, None);
+    assert!(h.restore(&push, "new", &[]).await?.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_skips_entries_whose_blob_disappeared() -> TestResult {
+    let h = harness(Options::default()).await?;
+    let push = h.token(PUSH_TO_MAIN)?;
+    assert_eq!(
+        h.save(&push, "deps-old", &archive(10, 1)).await?,
+        StatusCode::OK
+    );
+    h.clock.advance(10);
+    assert_eq!(
+        h.save(&push, "deps-new", &archive(10, 2)).await?,
+        StatusCode::OK
+    );
+
+    let (_, found) = h
+        .rpc(
+            "GetCacheEntryDownloadURL",
+            Some(&push),
+            &json!({"key": "deps-new", "version": "v1"}),
+        )
+        .await?;
+    let url = found["signed_download_url"].as_str().ok_or("url")?;
+    let blob_id = path_of(url)?
+        .trim_start_matches("/v1/cache/blobs/")
+        .split('?')
+        .next()
+        .ok_or("id")?
+        .to_owned();
+    h.store
+        .delete(&open_ci_cache::BlobId::parse(&blob_id)?)
+        .await?;
+
+    let restored = h.restore(&push, "deps-x", &["deps-"]).await?;
+    assert_eq!(restored.map(|(key, _)| key).as_deref(), Some("deps-old"));
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+struct Recorded(Arc<Mutex<Vec<ForwardedCall>>>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ForwardedCall {
+    method: String,
+    authorization: Option<String>,
+    body: String,
+}
+
+#[tokio::test]
+async fn non_cache_twirp_calls_pass_through_to_github_results_service() -> TestResult {
+    let recorded = Recorded::default();
+    let upstream = Router::new()
+        .route(
+            "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+            post(
+                |State(rec): State<Recorded>, headers: HeaderMap, body: String| async move {
+                    let auth = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    if let Ok(mut calls) = rec.0.lock() {
+                        calls.push(ForwardedCall {
+                            method: "CreateArtifact".to_owned(),
+                            authorization: auth,
+                            body,
+                        });
+                    }
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"ok":true,"signed_upload_url":"https://blob.example/x"}"#,
+                    )
+                },
+            ),
+        )
+        .with_state(recorded.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_url = format!("http://{}", listener.local_addr()?);
+    let upstream_task = tokio::spawn(async move { axum::serve(listener, upstream).await });
+
+    let h = harness(Options {
+        upstream: upstream_url,
+        ..Options::default()
+    })
+    .await?;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact")
+        .header(header::AUTHORIZATION, "Bearer job-token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"name":"report"}"#))?;
+    let response = h.app.clone().oneshot(request).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024).await?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body)?["signed_upload_url"],
+        "https://blob.example/x"
+    );
+    let calls = recorded.0.lock().map_err(|_| "lock")?.clone();
+    assert_eq!(
+        calls,
+        vec![ForwardedCall {
+            method: "CreateArtifact".to_owned(),
+            authorization: Some("Bearer job-token".to_owned()),
+            body: r#"{"name":"report"}"#.to_owned(),
+        }]
+    );
+
+    let (status, _) = h.rpc("DeleteCacheEntry", Some("t"), &json!({})).await?;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "unknown cache methods are never forwarded"
+    );
+    upstream_task.abort();
     Ok(())
 }

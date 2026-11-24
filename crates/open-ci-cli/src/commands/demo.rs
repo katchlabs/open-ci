@@ -28,6 +28,7 @@ pub fn build_demo_config(listen: &str) -> OpenCiConfig {
             cloud_discovery_seconds: 60,
             prefer_cheapest: true,
             provider_weights: BTreeMap::new(),
+            transparent_cache: false,
             placements: vec![Placement {
                 provider: ProviderKind::Mock,
                 region: "local-1".to_owned(),

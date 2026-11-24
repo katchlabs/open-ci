@@ -22,11 +22,11 @@ flowchart LR
         CP["open-ci serve (User=open-ci, ReadOnly /etc/open-ci)"]
         DB["SQLite WAL + fs2 lock (0600)"]
         BROKER["open-ci rotate-credentials (User=open-ci-broker, holds github-app.pem 0600)"]
-        CACHE["open-ci cache (Private VPC, Scoped HMAC + Signed Blob URLs)"]
+        CACHE["open-ci cache (Private VPC, Runtime-Token Ref Scopes + Signed Blob URLs)"]
     end
 
     VM -->|"1x HMAC bootstrap + 512B usage"| EDGE --> CP
-    VM -->|"Scoped HMAC Bearer + Signed URLs"| CACHE
+    VM -->|"ACTIONS_RUNTIME_TOKEN + Signed URLs"| CACHE
     CP --> DB
     BROKER -->|"Atomic 0640 rotated tokens"| CP
 ```
@@ -39,7 +39,7 @@ flowchart LR
 | Compromised control plane steals GitHub App private key | Privilege-separated `open-ci-broker` user owns `github-app.pem` (`0o600`, symlink rejected); `open-ci` only reads rotated short-lived tokens (`0o640`) | `open-ci-github/src/broker.rs`, `deploy/systemd/open-ci-credentials.service` |
 | Forged webhook or OIDC token triggers unauthorized runner spend | Constant-time HMAC-SHA256 webhook check; RS256 OIDC JWT verification pinning `aud`, `iss`, `owner_id`, `repository_id`/allowlist, `sub`, and 40-char workflow SHA | `open-ci-github/src/webhook.rs`, `open-ci-github/src/oidc.rs` |
 | Zombie VMs or leaked EBS volumes burn cloud budget | Triple-layer hard expiry: reconciler TTL, cloud-native `maxRunDuration` / fault-isolated `open-ci-aws-janitor`, and guest `systemctl poweroff` | `open-ci-core/src/reconcile.rs`, `open-ci-provider-gcp`, `open-ci-aws-janitor`, `open-ci-cli/src/agent.rs` |
-| Cross-repo cache poisoning or path traversal | Repository-scoped HMAC-SHA256 bearer tokens, per-operation signed blob URLs, strict ID/key character validation, bounded reads | `open-ci-cache/src/auth.rs`, `open-ci-cache/src/http.rs` |
+| Cross-repo or cross-branch cache poisoning, path traversal | Verified Actions runtime tokens with a repository-ID allowlist, immutable entries keyed by Git ref scope (PRs never write the base branch), per-operation signed blob URLs, validated `BlobId`/`BlockId` newtypes, enforced `Content-Length` | `open-ci-github/src/runtime_token.rs`, `open-ci-cache/src/http/`, `open-ci-cache/src/ids.rs` |
 | Cross-account BYOC confused deputy | AWS STS `AssumeRole` with `ExternalId`; GCP IAM Credentials API impersonation with strict SA validation | `open-ci-provider-aws/src/credentials/`, `open-ci-provider-gcp/src/auth/` |
 | Public exposure of operator controls or metrics | Caddy public allowlist blocks `/api/v1/*` and `/metrics`; constant-time bearer middleware disables API (`403`) if token file is unset | `deploy/caddy/Caddyfile.example`, `open-ci-server/src/http/operator.rs` |
 | Secret leakage in structured JSON logs | `SecretString` redacts both `Debug` and `Display` to `[REDACTED]`; clean secret-free `ApiError` responses | `open-ci-core/src/secret.rs`, `open-ci-server/src/http/mod.rs` |
@@ -94,7 +94,7 @@ When `admission.mode` is `"oidc"` or `"hybrid"`, `POST /v1/ingress/admit` enforc
 
 - **Webhooks:** `X-Hub-Signature-256` verified via `hmac::Mac::verify_slice` (constant-time) before JSON parsing or repository allowlist checks.
 - **Operator API:** `OPEN_CI_OPERATOR_TOKEN_FILE` (>= 24 bytes) verified via domain-separated HMAC (`open-ci-operator-bearer-token-v1`) + `verify_slice` so variable-length tokens never leak timing or length.
-- **Cache tokens & signed URLs:** Verified via `hmac::Mac::verify_slice` in `open-ci-cache/src/auth.rs`.
+- **Cache signed URLs:** Verified via `hmac::Mac::verify_slice` in `open-ci-cache/src/capability.rs`.
 - **Rust memory & panic safety:** Workspace Cargo lints enforce `unsafe_code = "forbid"`, `clippy::unwrap_used = "deny"`, `clippy::expect_used = "deny"`, and `clippy::panic = "deny"`.
 
 ### 6. Triple-Layer Hard VM Expiry
@@ -106,13 +106,15 @@ Even if the controller crashes, loses network access, or a workflow hangs indefi
    - **AWS:** Every instance and EBS volume is tagged `open-ci-managed=true` and `open-ci-expires-at=<unix>`. `open-ci-aws-janitor` runs independently on AWS Lambda (`provided.al2023`) or cron, clamps deadlines to `launch_time + max_ceiling_seconds`, **fails closed** (treats missing or unparseable `open-ci-expires-at` tags as expired), and isolates errors per resource so one failed API call never blocks sweeping remaining expired instances or unattached volumes.
 3. **Layer 3 — Guest Agent Timeout:** `open-ci agent bootstrap` bounds the child `run.sh` process with `tokio::time::timeout(lifetime_seconds)` (`kill_on_drop(true)`) and executes `systemctl poweroff` on exit (paired with AWS `InstanceInitiatedShutdownBehavior=terminate`).
 
-### 7. Scoped HMAC Cache Isolation
+### 7. Runtime-Token Cache Isolation
 
-`open-ci-cache` prevents cross-repository cache snooping or poisoning in multi-repo organizations:
-- `open-ci-server` mints a per-worker bearer token (`<base64url(claims)>.<hex_hmac_sha256>`) whose `scope` is bound to the admitted `repository` (or configured GitHub scope) and whose `exp` equals `now + pool.lifetime_seconds`.
-- Every Twirp RPC (`CreateCacheEntry`, `FinalizeCacheEntryUpload`, `GetCacheEntryDownloadURL`) authenticates the bearer token and scopes index lookups/writes exclusively to `claims.scope`.
-- Blob endpoints (`/v1/cache/blobs/{id}`) authenticate time-limited capability URLs signed over `blob:{blob_id}:{op}:{exp}` so a download URL (`op=get`) cannot overwrite a blob (`op=put`).
-- Strict validators enforce length and character allowlists on `scope`, `key`, `version`, `blob_id` (alphanumeric + `-`/`_` only — zero path traversal), and `blockid`, plus `max_entry_bytes` enforcement on both `Content-Length` and streamed body reads.
+`open-ci-cache` reproduces GitHub's cache isolation instead of trusting the network:
+- Every Twirp RPC (`CreateCacheEntry`, `FinalizeCacheEntryUpload`, `GetCacheEntryDownloadURL`) requires the job's own `ACTIONS_RUNTIME_TOKEN`, verified as RS256 against the issuer JWKS (`cache.auth.issuer`, optional `jwks_url`/`audience`). Its `repository_id` must be listed in `cache.auth.repositories` (or the operator must explicitly set `"any"`). No cache credential exists on workers beyond the token GitHub already gives each job.
+- The token's `ac` claim lists ref scopes with read/write bits. Saves go only to the writable ref; restores search the job's own ref, then the read-only base/default refs. A pull request can therefore read `main`'s cache but can never write into it, and `main` never restores a PR's entry.
+- Entries are immutable: a second save of the same `(repository, ref, version, key)` is rejected with `409`, the finalized size must match the declared size, and upload URLs stop accepting bytes once the entry is finalized or its reservation goes stale.
+- Blob endpoints (`/v1/cache/blobs/{id}`) authenticate time-limited capability URLs signed over `blob:{blob_id}:{op}:{exp}`, so a download URL (`op=get`) cannot overwrite a blob (`op=put`). Request logs record only method and path, never signed query strings.
+- `BlobId` (server-minted, alphanumeric + `-`/`_`) and `BlockId` (stored as a SHA-256 hex name) are validated newtypes, so no client input reaches a file path or object key. Uploads must declare `Content-Length`; bodies that are shorter or longer fail before any backend publishes them.
+- Server-side failures return a generic `5xx` message; storage details are logged, not returned.
 
 ### 8. BYOC Cross-Account & Cross-Project Identity
 

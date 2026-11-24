@@ -1,6 +1,13 @@
 //! Unified, vendor-neutral configuration schema and modular validators.
 
+mod cache;
 mod validate;
+
+pub use cache::{
+    AnyRepository, AwsCredentialsConfig, CacheAuthConfig, CacheRetentionConfig, CacheServiceConfig,
+    CacheStorageConfig, DEFAULT_ACTIONS_RESULTS_URL, DEFAULT_ACTIONS_TOKEN_ISSUER,
+    DEFAULT_GCS_ENDPOINT, GcpCredentialsConfig, RepositoryAllowlist,
+};
 
 use crate::error::ConfigError;
 use crate::models::{AdmissionMode, Architecture, Capacity, GitHubScope, ProviderKind};
@@ -118,41 +125,6 @@ pub struct AwsProviderConfig {
     pub role_session_name: Option<String>,
 }
 
-/// Optional built-in GitHub Actions v2 transparent cache configuration (`open-ci cache`).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CacheServiceConfig {
-    /// Listen address for `open-ci cache` (defaults to `0.0.0.0:8090`).
-    #[serde(default = "default_cache_listen")]
-    pub listen: String,
-    /// URL reachable by runner VMs (injected as `ACTIONS_RESULTS_URL`).
-    pub public_url: String,
-    /// Local filesystem / `NVMe` directory for `LocalFsStorage` with LRU eviction.
-    #[serde(default)]
-    pub storage_dir: Option<String>,
-    /// Maximum single cache entry size in bytes (defaults to 10 GiB).
-    #[serde(default = "default_cache_max_entry_bytes")]
-    pub max_entry_bytes: u64,
-    /// Maximum total local storage bytes before LRU eviction (defaults to 50 GiB).
-    #[serde(default = "default_cache_max_total_bytes")]
-    pub max_total_bytes: u64,
-    /// Signed upload/download URL TTL in seconds (defaults to 900s).
-    #[serde(default = "default_cache_signed_url_ttl_seconds")]
-    pub signed_url_ttl_seconds: u64,
-    /// Optional S3-compatible endpoint (AWS S3, Cloudflare R2, `MinIO`, GCS S3-interop).
-    #[serde(default)]
-    pub s3_endpoint: Option<String>,
-    /// S3 signing region (e.g. `us-east-1` or `auto` for Cloudflare R2).
-    #[serde(default)]
-    pub s3_region: Option<String>,
-    /// S3 bucket name when using `S3CompatibleStorage`.
-    #[serde(default)]
-    pub s3_bucket: Option<String>,
-    /// Optional key prefix inside the S3 bucket.
-    #[serde(default)]
-    pub s3_prefix: Option<String>,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionConfig {
@@ -214,6 +186,11 @@ pub struct PoolConfig {
     pub prefer_cheapest: bool,
     #[serde(default)]
     pub provider_weights: BTreeMap<ProviderKind, u32>,
+    /// Point this pool's jobs at `open-ci cache` by redirecting the runner's results URL.
+    /// Jobs using `container:` or Docker container actions then lose `ACTIONS_RESULTS_URL`
+    /// inside the container, so leave this off for pools that run them.
+    #[serde(default)]
+    pub transparent_cache: bool,
     pub placements: Vec<Placement>,
 }
 
@@ -290,6 +267,14 @@ impl PoolConfig {
 }
 
 impl OpenCiConfig {
+    /// Cache URL handed to a pool's workers: only when `[cache]` exists and the pool opted in.
+    pub fn worker_cache_url(&self, pool: &PoolConfig) -> Option<&str> {
+        self.cache
+            .as_ref()
+            .filter(|_| pool.transparent_cache)
+            .map(|cache| cache.public_url.as_str())
+    }
+
     pub fn parse_toml(input: &str) -> Result<Self, ConfigError> {
         let cfg: Self = toml::from_str(input)?;
         cfg.validate()?;
@@ -355,16 +340,4 @@ const fn default_cloud_discovery_seconds() -> u64 {
 }
 const fn default_true() -> bool {
     true
-}
-fn default_cache_listen() -> String {
-    "0.0.0.0:8090".to_owned()
-}
-const fn default_cache_max_entry_bytes() -> u64 {
-    10 * 1024 * 1024 * 1024
-}
-const fn default_cache_max_total_bytes() -> u64 {
-    50 * 1024 * 1024 * 1024
-}
-const fn default_cache_signed_url_ttl_seconds() -> u64 {
-    900
 }

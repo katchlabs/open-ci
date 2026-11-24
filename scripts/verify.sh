@@ -20,7 +20,7 @@ Runs the 7-gate open-ci proof ladder:
   Gate 1: Static, Lint & Hexagonal Purity (fmt, clippy -D warnings, zero #[allow(, open-ci-core purity)
   Gate 2: Domain Invariants, Storage, Wire Contracts & E2E (cargo test --workspace)
   Gate 3: Offline Config Validation (open-ci validate)
-  Gate 4: Real Compiled-Binary Runtime Proof (drive.sh: Launch -> Doctor -> Drive -> HTTP + SQLite Evidence -> Cleanup) [skipped in --fast]
+  Gate 4: Real Compiled-Binary Runtime Proof (drive.sh + official @actions/cache client against open-ci cache) [skipped in --fast]
   Gate 5: TypeScript Routing Action (node --test)
   Gate 6: IaC, Packer & Security Policy Invariants (terraform fmt, bash -n, shellcheck, IMDSv2/zero-IAM)
   Gate 7: Route & Doc Parity (crates/open-ci-server/src/http/ <-> docs/architecture.md)
@@ -95,6 +95,11 @@ else
     fail "Missing executable runtime driver ${DRIVE_SCRIPT}. Restore it and run chmod +x ${DRIVE_SCRIPT}."
   fi
   "$DRIVE_SCRIPT"
+  if command -v npm >/dev/null 2>&1; then
+    ./scripts/cache-client-e2e.sh
+  else
+    echo "  warn: npm not installed; skipping official @actions/cache client proof (scripts/cache-client-e2e.sh)"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -116,7 +121,7 @@ else
   echo "  warn: terraform not installed; skipping terraform fmt -check"
 fi
 
-bash -n scripts/verify.sh .agents/skills/verify-open-ci/scripts/drive.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh
+bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh
 echo "  ok: bash -n passed for verify.sh, drive.sh, and Packer runner scripts"
 
 if command -v shellcheck >/dev/null 2>&1; then

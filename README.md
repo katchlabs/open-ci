@@ -13,7 +13,7 @@ flowchart LR
     GH["GitHub Actions"] -->|"workflow_job webhook or OIDC JWT"| CP["open-ci Control Plane (Rust / Axum / SQLite)"]
     CP -->|"EC2 SigV4 / Compute Engine REST"| VM["Ephemeral Spot / On-Demand VMs (Zero IAM, Auto-NVMe)"]
     VM -->|"Single-use HMAC bootstrap -> JIT config"| CP
-    VM -->|"Actions Cache v2 (Twirp + Blob)"| CACHE["open-ci cache (Local NVMe LRU or S3 / R2)"]
+    VM -->|"Actions Cache v2 (Twirp + Blob)"| CACHE["open-ci cache (Local NVMe, S3 or GCS)"]
     VM -->|"Outbound HTTPS only"| GH
     OP["Operator CLI / Prometheus / SSE"] -->|"Private loopback or VPN + Bearer"| CP
 ```
@@ -23,7 +23,7 @@ flowchart LR
 - **Drop-in or fail-closed routing.** Use `admission.mode = "webhook"` for zero workflow edits (`runs-on: open-ci-linux-x64`), `admission.mode = "oidc"` with [`actions/route`](actions/route) to fail closed to `ubuntu-latest` on outage, drain, or capacity exhaustion, or `"hybrid"` for both.
 - **Org-wide and multi-repo native.** Target a single `owner/repo` or an entire GitHub organization with `allowed_repositories` allowlists (e.g. `["my-org/*"]`) and `runner_group_id` JIT registration.
 - **Multi-cloud without SDK bloat.** Pure-Rust AWS EC2 + STS SigV4/XML and GCP Compute Engine REST adapters — no `aws` or `gcloud` CLI subprocesses, with native BYOC identity (`IMDSv2` + STS `AssumeRole` with `ExternalId`; GCE metadata + IAM service account impersonation).
-- **Fast builds out of the box.** Built-in GitHub Actions v2 transparent cache (`open-ci cache`) backed by local NVMe LRU or pure-Rust SigV4 S3/R2/MinIO, plus boot-time auto-detection and `ext4`/RAID0 mounting of local ephemeral NVMe SSDs for Docker layers, `RUNNER_WORKDIR`, and `TMPDIR`.
+- **Fast builds out of the box.** Built-in GitHub Actions v2 transparent cache (`open-ci cache`) that authorizes each job with its own runtime token and isolates entries per repository and branch exactly like GitHub, backed by local NVMe, native S3 (S3/R2/MinIO), or native GCS with keyless VM credentials, plus boot-time auto-detection and `ext4`/RAID0 mounting of local ephemeral NVMe SSDs for Docker layers, `RUNNER_WORKDIR`, and `TMPDIR`.
 - **Zero-IAM, hard-bounded runners.** Workers boot with zero cloud IAM (`serviceAccounts: []` on GCP; no instance profile + IMDSv2 required on AWS), zero inbound ports, single-use atomic HMAC bootstrap tokens, and triple-layer expiry (reconciler + `maxRunDuration`/`open-ci-aws-janitor` + guest `poweroff`).
 - **Single binary, strict Rust safety.** Compiles to static-friendly `x86_64` and `aarch64` Linux binaries and multi-arch GHCR containers under `unsafe_code = "forbid"`, `clippy::unwrap_used = "deny"`, `expect_used = "deny"`, and `panic = "deny"`.
 
@@ -178,7 +178,7 @@ jobs:
 | `crates/open-ci-provider-mock` | Deterministic fault-injecting provider for tests and `open-ci demo`. |
 | `crates/open-ci-github` | Typed GitHub REST client (bounded pagination, repo & org JIT registration), constant-time HMAC webhook verifier, RS256 OIDC JWT verifier, privilege-separated credential broker. |
 | `crates/open-ci-server` | Non-blocking `ControlPlane`, background reconciler, public machine ingress, authenticated Operator API, SSE stream, and Prometheus `/metrics`. |
-| `crates/open-ci-cache` | Native GitHub Actions v2 transparent cache server (Twirp RPCs + Azure block blob protocol) with `LocalFsStorage` (NVMe + LRU) and pure-Rust SigV4 `S3CompatibleStorage`. |
+| `crates/open-ci-cache` | Native GitHub Actions v2 transparent cache server (Twirp RPCs + Azure block blob protocol): runtime-token auth with ref-scoped entries, `SQLite` index with retention, streaming `local`/`s3`/`gcs` blob stores, and results-service passthrough. |
 | `crates/open-ci-aws-janitor` | Standalone Rust CLI and AWS Lambda (`provided.al2023`) expiry guard that terminates leaked EC2 instances and detached EBS volumes with per-resource fault isolation. |
 | `crates/open-ci-cli` | Unified CLI binary (`serve`, `cache`, `demo`, `validate`, `ctl`, `backup`, `rotate-credentials`, `agent bootstrap`). |
 | `actions/route` | Zero-dependency TypeScript (`node24`) GitHub Action for fail-closed OIDC admission routing. |
@@ -206,7 +206,7 @@ We prefer clear engineering boundaries over marketing claims:
 | ✓ | Multi-cloud AWS + GCP Spot & On-Demand provisioning | Pure-Rust SigV4/XML EC2 + Compute Engine REST |
 | ✓ | Org-level & multi-repo runner pools | `organization`, `allowed_repositories`, `runner_group_id` |
 | ✓ | `webhook`, `oidc`, and `hybrid` admission modes | Drop-in webhooks or fail-closed `actions/route` |
-| ✓ | Native GitHub Actions v2 transparent cache (`open-ci cache`) | Local NVMe LRU and S3 / R2 / MinIO / GCS S3-interop |
+| ✓ | Native GitHub Actions v2 transparent cache (`open-ci cache`) | Local NVMe, native S3 / R2 / MinIO, and native GCS; verified with the official `@actions/cache` client |
 | ✓ | Auto-NVMe RAID0/ext4 boot setup & BuildKit tuning | `x64` and `arm64` Ubuntu 24.04 Packer images |
 | ✓ | BYOC cross-account AWS `AssumeRole` & GCP SA impersonation | `ExternalId` support, EC2 IMDSv2, GCE metadata |
 | ✓ | Turnkey Terraform modules & automated multi-arch releases | `aws-controller`, `gcp-controller`, GHCR + `.tar.gz` |

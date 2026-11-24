@@ -15,6 +15,7 @@
 !**/example.tfvars
 .DS_Store
 *.pem
+!/fixtures/actions-runtime-token-TEST-ONLY.pem
 *.key
 .env
 .env.local

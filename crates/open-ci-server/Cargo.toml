@@ -9,7 +9,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-open-ci-cache = { workspace = true }
 open-ci-core = { workspace = true }
 open-ci-github = { workspace = true }
 open-ci-provider = { workspace = true }

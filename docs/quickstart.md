@@ -184,16 +184,19 @@ Start from [`config/open-ci.example.toml`](../config/open-ci.example.toml). Key 
 - **Transparent Actions v2 Cache (optional):**
   ```toml
   [cache]
-  listen = "0.0.0.0:8090"
-  public_url = "http://10.0.0.5:8090" # Controller private VPC IP reachable by runner subnets
-  storage_dir = "/var/lib/open-ci-cache"
-  # Or use S3 / Cloudflare R2 / MinIO / GCS S3-interop instead of storage_dir:
-  # s3_endpoint = "https://<account-id>.r2.cloudflarestorage.com"
-  # s3_region = "auto"
-  # s3_bucket = "open-ci-cache"
-  # s3_prefix = "actions/"
+  public_url = "http://10.0.0.5:8090" # Private address runner subnets reach the cache on
+
+  [cache.auth]
+  repositories = [123456789] # Numeric GitHub repository IDs allowed to use the cache, or "any"
+
+  [cache.storage]            # Omit for local disk at /var/lib/open-ci-cache/blobs
+  type = "gcs"               # or "s3" (with region) or "local" (with path)
+  bucket = "acme-ci-cache"   # Same region as your runners
+  # [cache.storage.credentials] defaults to the VM identity: GCP metadata server or AWS instance role
   ```
-  If using S3/R2, put `OPEN_CI_CACHE_SIGNING_KEY_FILE`, `OPEN_CI_CACHE_S3_ACCESS_KEY_ID`, and `OPEN_CI_CACHE_S3_SECRET_ACCESS_KEY` into `/etc/open-ci/cache.env` (`0o600`, owned by `open-ci`).
+  Then set `transparent_cache = true` on each pool that should use it. Leave it off for pools running `container:` jobs or Docker container actions: the runner does not forward the redirected `ACTIONS_RESULTS_URL` into containers, so artifact uploads and caching inside them would fail.
+
+  Find a repository ID with `gh api repos/OWNER/REPO --jq .id`. Grant the controller's service account or instance role read/write on the bucket; runners never receive storage credentials. Put `OPEN_CI_CACHE_SIGNING_KEY_FILE` in `/etc/open-ci/cache.env` (`0o600`, owned by `open-ci`); for S3-compatible services that need static keys, set `credentials.type = "environment"` and add `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` there.
 
 ### 3.3 Write `/etc/open-ci/broker.toml` and Validate Offline
 

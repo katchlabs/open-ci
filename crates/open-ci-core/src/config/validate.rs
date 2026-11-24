@@ -1,6 +1,9 @@
 //! Offline configuration validators for [`OpenCiConfig`].
 
-use super::{OidcTrustConfig, OpenCiConfig, Placement, PoolConfig};
+use super::{
+    AwsCredentialsConfig, CacheStorageConfig, GcpCredentialsConfig, OidcTrustConfig, OpenCiConfig,
+    Placement, PoolConfig, RepositoryAllowlist,
+};
 use crate::error::ConfigError;
 use crate::models::{GitHubScope, ProviderKind, is_valid_github_segment, split_repository};
 use std::collections::BTreeSet;
@@ -285,54 +288,143 @@ fn validate_cache(cfg: &OpenCiConfig) -> Result<(), ConfigError> {
         .listen
         .parse()
         .map_err(|_| ConfigError::invalid("cache.listen", "must be host:port"))?;
-    let base = cache.public_url.trim();
-    if !(base.starts_with("http://") || base.starts_with("https://")) {
-        return Err(ConfigError::invalid(
-            "cache.public_url",
-            "must start with http:// or https://",
-        ));
+    require_http_url("cache.public_url", &cache.public_url)?;
+    require_http_url("cache.upstream_results_url", &cache.upstream_results_url)?;
+    require_http_url("cache.auth.issuer", &cache.auth.issuer)?;
+    if let Some(jwks_url) = &cache.auth.jwks_url {
+        require_http_url("cache.auth.jwks_url", jwks_url)?;
     }
-    if cache.max_entry_bytes == 0 || cache.max_total_bytes == 0 || cache.signed_url_ttl_seconds == 0
+    if cache
+        .auth
+        .audience
+        .as_deref()
+        .is_some_and(|aud| aud.trim().is_empty())
     {
         return Err(ConfigError::invalid(
-            "cache",
-            "max_entry_bytes, max_total_bytes, and signed_url_ttl_seconds must be positive",
+            "cache.auth.audience",
+            "must be non-empty when set",
         ));
     }
-    let has_local = cache
-        .storage_dir
-        .as_deref()
-        .is_some_and(|d| !d.trim().is_empty());
-    let has_s3 = cache.s3_endpoint.is_some() || cache.s3_bucket.is_some();
-    if !has_local && !has_s3 {
+    if matches!(&cache.auth.repositories, RepositoryAllowlist::Ids(ids) if ids.is_empty()) {
+        return Err(ConfigError::invalid(
+            "cache.auth.repositories",
+            "list at least one numeric repository ID, or set \"any\" to accept every repository",
+        ));
+    }
+    if cache.max_entry_bytes == 0 || cache.signed_url_ttl_seconds == 0 {
         return Err(ConfigError::invalid(
             "cache",
-            "configure either `storage_dir` or S3 (`s3_endpoint` + `s3_bucket`)",
+            "max_entry_bytes and signed_url_ttl_seconds must be positive",
         ));
     }
-    if has_s3 {
-        if cache
-            .s3_endpoint
-            .as_deref()
-            .is_none_or(|e| !(e.starts_with("http://") || e.starts_with("https://")))
-        {
-            return Err(ConfigError::invalid(
-                "cache.s3_endpoint",
-                "must start with http:// or https:// when S3 backend is configured",
-            ));
+    require_non_empty("cache.index_path", &cache.index_path)?;
+    let retention = &cache.retention;
+    if retention.max_total_bytes < cache.max_entry_bytes
+        || retention.max_unused_days == 0
+        || retention.sweep_interval_seconds == 0
+    {
+        return Err(ConfigError::invalid(
+            "cache.retention",
+            "max_total_bytes must be >= max_entry_bytes, and max_unused_days and sweep_interval_seconds must be positive",
+        ));
+    }
+    validate_cache_storage(&cache.storage)
+}
+
+fn validate_cache_storage(storage: &CacheStorageConfig) -> Result<(), ConfigError> {
+    match storage {
+        CacheStorageConfig::Local { path } => require_non_empty("cache.storage.path", path),
+        CacheStorageConfig::S3 {
+            bucket,
+            region,
+            endpoint,
+            prefix,
+            credentials,
+        } => {
+            require_bucket("cache.storage.bucket", bucket)?;
+            require_non_empty("cache.storage.region", region)?;
+            if let Some(endpoint) = endpoint {
+                require_http_url("cache.storage.endpoint", endpoint)?;
+            }
+            require_prefix(prefix)?;
+            if let AwsCredentialsConfig::AssumeRole { role_arn, .. } = credentials
+                && !role_arn.starts_with("arn:")
+            {
+                return Err(ConfigError::invalid(
+                    "cache.storage.credentials.role_arn",
+                    "must be an IAM role ARN",
+                ));
+            }
+            Ok(())
         }
-        if cache
-            .s3_bucket
-            .as_deref()
-            .is_none_or(|b| b.trim().is_empty())
-        {
-            return Err(ConfigError::invalid(
-                "cache.s3_bucket",
-                "must be non-empty when S3 backend is configured",
-            ));
+        CacheStorageConfig::Gcs {
+            bucket,
+            endpoint,
+            prefix,
+            credentials,
+        } => {
+            require_bucket("cache.storage.bucket", bucket)?;
+            if let Some(endpoint) = endpoint {
+                require_http_url("cache.storage.endpoint", endpoint)?;
+            }
+            require_prefix(prefix)?;
+            match credentials {
+                GcpCredentialsConfig::Metadata => Ok(()),
+                GcpCredentialsConfig::Impersonate { service_account } => {
+                    require_non_empty("cache.storage.credentials.service_account", service_account)
+                }
+                GcpCredentialsConfig::TokenFile { path } => {
+                    require_non_empty("cache.storage.credentials.path", path)
+                }
+            }
         }
     }
-    Ok(())
+}
+
+fn require_http_url(field: &'static str, value: &str) -> Result<(), ConfigError> {
+    let value = value.trim();
+    let has_host = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'));
+    if has_host {
+        Ok(())
+    } else {
+        Err(ConfigError::invalid(
+            field,
+            "must be an http:// or https:// URL with a host",
+        ))
+    }
+}
+
+fn require_non_empty(field: &'static str, value: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        Err(ConfigError::invalid(field, "must be non-empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_bucket(field: &'static str, bucket: &str) -> Result<(), ConfigError> {
+    if bucket.trim().is_empty() || bucket.contains('/') {
+        Err(ConfigError::invalid(
+            field,
+            "must be a bucket name without slashes",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_prefix(prefix: &str) -> Result<(), ConfigError> {
+    if prefix.starts_with('/') || prefix.contains("..") {
+        Err(ConfigError::invalid(
+            "cache.storage.prefix",
+            "must be relative and must not contain `..`",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_admission(cfg: &OpenCiConfig) -> Result<(), ConfigError> {
@@ -384,6 +476,12 @@ fn validate_pools(cfg: &OpenCiConfig) -> Result<(), ConfigError> {
             return Err(ConfigError::invalid(
                 "pools.runner_label",
                 "runner_label must be unique across pools",
+            ));
+        }
+        if pool.transparent_cache && cfg.cache.is_none() {
+            return Err(ConfigError::invalid(
+                "pools.transparent_cache",
+                "requires a [cache] section",
             ));
         }
         validate_pool_bounds(cfg, pool)?;

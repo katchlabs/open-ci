@@ -54,16 +54,21 @@ account_id = "123456789012"
 # role_arn = "arn:aws:iam::123456789012:role/open-ci-controller"
 # external_id = "your-unique-external-id"
 
-# Optional built-in GitHub Actions v2 transparent cache (`open-ci cache --config ...`):
+# Optional built-in GitHub Actions v2 transparent cache (`open-ci cache --config ...`).
+# Jobs authenticate with their own ACTIONS_RUNTIME_TOKEN; entries are isolated per repository and Git ref.
+# Pools opt in with `transparent_cache = true` (not for pools running `container:` jobs or Docker actions).
 # [cache]
-# listen = "0.0.0.0:8090"
-# public_url = "http://10.0.0.5:8090"
-# storage_dir = "/var/lib/open-ci-cache"
-# Or use S3 / Cloudflare R2 / GCS S3-interop instead of local NVMe storage:
-# s3_endpoint = "https://<account-id>.r2.cloudflarestorage.com"
-# s3_region = "auto"
-# s3_bucket = "open-ci-cache"
-# s3_prefix = "actions/"
+# public_url = "http://10.0.0.5:8090"          # Private address runner subnets reach the cache on
+# [cache.auth]
+# repositories = [123456789]                     # Numeric repository IDs (gh api repos/OWNER/REPO --jq .id), or "any"
+# [cache.storage]                                # Defaults to type = "local", path = "/var/lib/open-ci-cache/blobs"
+# type = "gcs"                                   # "local" | "s3" | "gcs"
+# bucket = "your-ci-cache"
+# [cache.storage.credentials]                    # gcs: "metadata" (default) | "impersonate" | "token_file"
+# type = "metadata"                              # s3:  "instance" (default) | "environment" | "assume_role"
+# [cache.retention]
+# max_total_bytes = 53687091200                  # 50 GiB LRU budget
+# max_unused_days = 7
 
 [admission]
 # Admission mode: "oidc" (default, requires actions/route), "webhook" (direct webhook auto-admission, zero workflow changes), or "hybrid".
