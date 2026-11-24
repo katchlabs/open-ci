@@ -23,7 +23,7 @@ jobs:
         with:
           node-version: "22"
       - name: Check verify.sh and drive.sh syntax
-        run: bash -n scripts/verify.sh .agents/skills/verify-open-ci/scripts/drive.sh
+        run: bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy strict check
@@ -46,6 +46,8 @@ jobs:
         run: cargo run --bin open-ci -- validate --config config/open-ci.example.toml
       - name: Compiled-binary runtime smoke proof (HTTP + SQLite DB side effects)
         run: ./.agents/skills/verify-open-ci/scripts/drive.sh
+      - name: Official @actions/cache client proof against open-ci cache
+        run: ./scripts/cache-client-e2e.sh
       - name: Security policy & route/doc parity checks
         run: |
           set -euo pipefail
