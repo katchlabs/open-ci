@@ -1354,7 +1354,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "open-ci-aws-janitor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "clap",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "open-ci-cache"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "open-ci-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "open-ci-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "serde",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "open-ci-github"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "open-ci-provider"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "open-ci-core",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "open-ci-provider-aws"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "open-ci-provider-gcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "open-ci-provider-mock"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "open-ci-core",
@@ -1520,7 +1520,7 @@ dependencies = [
 
 [[package]]
 name = "open-ci-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "bytes",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "open-ci-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "fs2",
