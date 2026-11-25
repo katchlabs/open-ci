@@ -1,39 +1,61 @@
-# open-ci
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/logo-light.svg">
+    <img alt="open-ci" src="docs/assets/logo-light.svg" height="52">
+  </picture>
+</p>
 
-**Self-hosted ephemeral GitHub Actions runners on Spot & On-Demand AWS and GCP VMs — written in Rust, with transparent Actions v2 caching, auto-NVMe scratch storage, and zero cloud IAM on workers.**
+<h3 align="center">Cut GitHub Actions compute costs by up to 90% and speed up builds — on your own AWS &amp; GCP Spot VMs.</h3>
 
-[![CI](https://github.com/katchlabs/open-ci/actions/workflows/ci.yml/badge.svg)](https://github.com/katchlabs/open-ci/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](rust-toolchain.toml)
+<p align="center">
+  A single Apache-2.0 Rust binary that runs ephemeral self-hosted GitHub Actions runners with built-in transparent Actions v2 caching, auto-NVMe RAID0 scratch disks, zero cloud IAM on workers, and fail-closed routing.
+</p>
+
+<p align="center">
+  <a href="https://github.com/katchlabs/open-ci/actions/workflows/ci.yml"><img src="https://github.com/katchlabs/open-ci/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/katchlabs/open-ci/releases/latest"><img src="https://img.shields.io/github/v/release/katchlabs/open-ci?display_name=tag&color=2ea043" alt="Latest Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/rust-1.89%2B-orange.svg" alt="Rust 1.89+"></a>
+</p>
+
+<p align="center">
+  <a href="#try-it-locally-in-30-seconds">Try Locally</a> ·
+  <a href="#cost-savings--benchmarks">Cost &amp; Benchmarks</a> ·
+  <a href="#wire-your-workflow">Workflow Setup</a> ·
+  <a href="#how-open-ci-compares">Compare</a> ·
+  <a href="docs/quickstart.md">Deploy to AWS / GCP</a> ·
+  <a href="docs/security.md">Security</a>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/savings-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/savings-light.svg">
+    <img alt="open-ci monthly cost savings and measured monorepo speedup" src="docs/assets/savings-light.svg" width="100%">
+  </picture>
+</p>
+
+<p align="center">
+  <sub>Late-2026 4-vCPU Linux rates (AWS/GCP Spot + ~$15/mo controller) and measured 20-shard TypeScript &amp; Playwright monorepo timings. See <a href="#cost-savings--benchmarks">full breakdown</a>.</sub>
+</p>
 
 ---
 
-```mermaid
-flowchart LR
-    GH["GitHub Actions"] -->|"workflow_job webhook or OIDC JWT"| CP["open-ci Control Plane (Rust / Axum / SQLite)"]
-    CP -->|"EC2 SigV4 / Compute Engine REST"| VM["Ephemeral Spot / On-Demand VMs (Zero IAM, Auto-NVMe)"]
-    VM -->|"Single-use HMAC bootstrap -> JIT config"| CP
-    VM -->|"Actions Cache v2 (Twirp + Blob)"| CACHE["open-ci cache (Local NVMe, S3 or GCS)"]
-    VM -->|"Outbound HTTPS only"| GH
-    OP["Operator CLI / Prometheus / SSE"] -->|"Private loopback or VPN + Bearer"| CP
-```
+## Why `open-ci`?
 
-## Why open-ci?
-
-- **Drop-in or fail-closed routing.** Use `admission.mode = "webhook"` for zero workflow edits (`runs-on: open-ci-linux-x64`), `admission.mode = "oidc"` with [`actions/route`](actions/route) to fail closed to `ubuntu-latest` on outage, drain, or capacity exhaustion, or `"hybrid"` for both.
-- **Org-wide and multi-repo native.** Target a single `owner/repo` or an entire GitHub organization with `allowed_repositories` allowlists (e.g. `["my-org/*"]`) and `runner_group_id` JIT registration.
-- **Multi-cloud without SDK bloat.** Pure-Rust AWS EC2 + STS SigV4/XML and GCP Compute Engine REST adapters — no `aws` or `gcloud` CLI subprocesses, with native BYOC identity (`IMDSv2` + STS `AssumeRole` with `ExternalId`; GCE metadata + IAM service account impersonation).
-- **Fast builds out of the box.** Built-in GitHub Actions v2 transparent cache (`open-ci cache`) that authorizes each job with its own runtime token and isolates entries per repository and branch exactly like GitHub, backed by local NVMe, native S3 (S3/R2/MinIO), or native GCS with keyless VM credentials, plus boot-time auto-detection and `ext4`/RAID0 mounting of local ephemeral NVMe SSDs for Docker layers, `RUNNER_WORKDIR`, and `TMPDIR`.
-- **Zero-IAM, hard-bounded runners.** Workers boot with zero cloud IAM (`serviceAccounts: []` on GCP; no instance profile + IMDSv2 required on AWS), zero inbound ports, single-use atomic HMAC bootstrap tokens, and triple-layer expiry (reconciler + `maxRunDuration`/`open-ci-aws-janitor` + guest `poweroff`).
+- **85–90% lower compute spend, zero SaaS tax.** Pay raw AWS and GCP Spot (or On-Demand) rates, burn existing cloud credits, and run the entire control plane on a single `~$12–$15/mo` VM (`t4g.small` or `e2-small`). Zero per-seat fees, zero cache markup.
+- **Faster builds out of the box.** Ships with a native **GitHub Actions Cache v2** server (`open-ci cache`, verified against the official `@actions/cache` client) backed by local NVMe, S3/R2/MinIO, or native GCS with keyless VM credentials — plus boot-time auto-NVMe `ext4`/RAID0 mounting for Docker layers, `RUNNER_WORKDIR`, and `TMPDIR`.
+- **Drop-in or fail-closed routing.** Change a single line (`runs-on: open-ci-linux-x64`) with `admission.mode = "webhook"`, or route via [`katchlabs/open-ci/actions/route@v0.1.1`](actions/route) in `oidc` / `hybrid` mode so controller downtime, drains, reruns, or capacity limits fall back cleanly to `ubuntu-latest` without breaking CI.
+- **Multi-cloud without Kubernetes or CLI bloat.** Pure-Rust AWS EC2 + STS SigV4/XML and GCP Compute Engine REST adapters spill automatically across regions, families, and clouds on Spot stockout. Native keyless cloud identity (`IMDSv2`, STS `AssumeRole` + `ExternalId`, GCE metadata, IAM SA impersonation, and keyless GCP→AWS web identity federation) plus org-wide multi-repo pools.
+- **Zero-IAM, hard-bounded workers.** Every ephemeral runner boots with zero cloud IAM (`serviceAccounts: []` on GCP; no instance profile + IMDSv2 enforced on AWS), zero inbound ports, single-use atomic HMAC bootstrap tokens, and triple-layer hard expiry (`reconciler` + `maxRunDuration`/`open-ci-aws-janitor` + guest `poweroff`).
 - **Single binary, strict Rust safety.** Compiles to static-friendly `x86_64` and `aarch64` Linux binaries and multi-arch GHCR containers under `unsafe_code = "forbid"`, `clippy::unwrap_used = "deny"`, `expect_used = "deny"`, and `panic = "deny"`.
 
 ---
 
-## 60-Second Local Quickstart (Zero Cloud Accounts)
+## Try It Locally in 30 Seconds
 
-Run the full control plane locally against `MockProvider` to inspect the operator API, SSE event stream, and Prometheus metrics before touching AWS or GCP.
-
-### 1. Install or run `open-ci`
+Run the full control plane locally against `MockProvider` — no AWS, GCP, or GitHub App required.
 
 ```bash
 # Option A: Multi-arch container (linux/amd64, linux/arm64)
@@ -44,22 +66,22 @@ curl -fsSL https://github.com/katchlabs/open-ci/releases/latest/download/open-ci
   | tar -xz -C /usr/local/bin
 open-ci demo --listen 127.0.0.1:8080
 
-# Option C: From source (Rust 1.89+)
+# Option C: Build from source (Rust 1.89+)
 cargo run --bin open-ci -- demo --listen 127.0.0.1:8080
 ```
 
-### 2. Query the live control plane
-
-In a second terminal:
+In a second terminal, query live control-plane state, metrics, and events:
 
 ```bash
 export OPEN_CI_URL="http://127.0.0.1:8080"
 export OPEN_CI_OPERATOR_TOKEN="demo-operator-token-000000000000"
 
 open-ci ctl status
+open-ci validate --config config/open-ci.example.toml
 ```
 
-Example output:
+<details>
+<summary>Inspect example <code>open-ci ctl status</code> output, Prometheus metrics, SSE stream, and drain controls</summary>
 
 ```json
 {
@@ -67,16 +89,8 @@ Example output:
   "admission_mode": "hybrid",
   "capacity": {
     "held_admissions": 0,
-    "limit": {
-      "disk_gb": 300,
-      "instances": 8,
-      "vcpu": 16
-    },
-    "reserved": {
-      "disk_gb": 20,
-      "instances": 1,
-      "vcpu": 2
-    }
+    "limit": { "disk_gb": 300, "instances": 8, "vcpu": 16 },
+    "reserved": { "disk_gb": 20, "instances": 1, "vcpu": 2 }
   },
   "control": {
     "mode": "active",
@@ -89,15 +103,9 @@ Example output:
   "repository": "example/repo",
   "scope": "example/repo",
   "timestamp": 1763916000,
-  "workers": {
-    "active": 0,
-    "by_phase": {},
-    "by_provider": {}
-  }
+  "workers": { "active": 0, "by_phase": {}, "by_provider": {} }
 }
 ```
-
-Inspect Prometheus metrics, stream live SSE events, or drain the control plane:
 
 ```bash
 curl -sS -H "Authorization: Bearer $OPEN_CI_OPERATOR_TOKEN" "$OPEN_CI_URL/metrics"
@@ -106,21 +114,17 @@ open-ci ctl set-mode draining --reason "maintenance"
 open-ci ctl set-mode active --reason "resume"
 ```
 
-Validate any configuration file offline before deploying:
-
-```bash
-open-ci validate --config config/open-ci.example.toml
-```
+</details>
 
 ---
 
-## 2-Minute Workflow Wiring
+## Wire Your Workflow
 
-Choose the admission mode that fits your repository or organization.
+Pick the admission mode that matches your team — or set `admission.mode = "hybrid"` to migrate incrementally across an entire GitHub organization (`organization` + `allowed_repositories` + `runner_group_id`).
 
-### Option A: Direct Webhook Mode (Zero Workflow Changes)
+### Option A: Zero-Friction Drop-In (`admission.mode = "webhook"`)
 
-Set `admission.mode = "webhook"` in `open-ci.toml`. Point a GitHub `workflow_job` webhook at `https://<your-domain>/v1/ingress/webhook`, then use your pool's `runner_label` directly:
+Point a GitHub `workflow_job` webhook at `https://<your-domain>/v1/ingress/webhook` and change one line:
 
 ```yaml
 jobs:
@@ -131,11 +135,9 @@ jobs:
       - run: cargo test --workspace
 ```
 
-When GitHub emits `workflow_job` (`queued`), `open-ci` verifies the HMAC-SHA256 signature, checks capacity guardrails, and launches a Spot or On-Demand VM that registers a single-use JIT runner for that label.
+### Option B: Fail-Closed OIDC Routing (`admission.mode = "oidc"` or `"hybrid"`)
 
-### Option B: Fail-Closed OIDC Routing (`actions/route`)
-
-Set `admission.mode = "oidc"` (or `"hybrid"` to support both). A lightweight routing job exchanges a GitHub OIDC JWT at `/v1/ingress/admit` for a scoped reservation label. If `open-ci` is unreachable, draining, at capacity, or handling a rerun (`fallback_on_rerun = true`), `actions/route` falls back cleanly to your configured runner label (`ubuntu-latest` or any custom label):
+A lightweight routing step exchanges a GitHub OIDC JWT for a scoped runner label. If your controller is unreachable, draining, at capacity, or handling a rerun, jobs fall back automatically to `ubuntu-latest` — CI never blocks on infrastructure:
 
 ```yaml
 jobs:
@@ -147,9 +149,8 @@ jobs:
     outputs:
       runners: ${{ steps.route.outputs.runners }}
     steps:
-      - uses: actions/checkout@v4
       - id: route
-        uses: ./actions/route
+        uses: katchlabs/open-ci/actions/route@v0.1.1
         with:
           endpoint: https://ci.example.com/v1/ingress/admit
           audience: open-ci:example-org/example-repo
@@ -166,14 +167,120 @@ jobs:
 
 ---
 
-## Workspace & Infrastructure Map
+## Cost Savings & Benchmarks
+
+### Per-Minute Compute Rates (4-vCPU Linux)
+
+| Runner Option | Spec / Instance | Per-Minute | Per-Hour | vs. GitHub Actions |
+| --- | --- | ---: | ---: | ---: |
+| GitHub Actions (x64) | 4 vCPU Linux x64 | `$0.0120/min` | `$0.720/hr` | baseline |
+| Managed Runner SaaS (e.g. Blacksmith) | 4 vCPU Linux x64 | `$0.0080/min` | `$0.480/hr` | −33% |
+| **`open-ci` · AWS Spot (x64)** | `c7a.xlarge` (4 vCPU / 8 GiB, `us-east-1`) | **`~$0.0014/min`** | **`~$0.085/hr`** | **~88% cheaper** |
+| **`open-ci` · GCP Spot (x64)** | `c3-standard-4` (4 vCPU / 16 GiB, `us-central1`) | **`~$0.0012/min`** | **`~$0.072/hr`** | **~90% cheaper** |
+| **`open-ci` · AWS Graviton Spot (ARM64)** | `c7g.xlarge` (4 vCPU / 8 GiB) | **`~$0.0012/min`** | **`~$0.072/hr`** | **~85% cheaper** *(vs. `$0.008/min` GH ARM64)* |
+
+<sub>Control plane overhead: one small VM (`e2-small` or `t4g.small`) = <strong>~$12–$15/mo flat</strong>.</sub>
+
+### Monthly All-In Cost by Team Size
+
+Estimates include the ~$15/mo controller VM and ephemeral boot disks. All compute stays on your own AWS/GCP bill (eligible for cloud credits) with zero per-seat fees or cache storage markup.
+
+| Team Profile | Monthly Volume | GitHub Actions | Managed SaaS | **`open-ci` (All-In)** | Annual Savings vs. GitHub |
+| --- | --- | ---: | ---: | ---: | ---: |
+| **Startup** (10 devs) | 40k 4-vCPU min/mo | `$480/mo` | `$320/mo` | **`~$75/mo`** | **`~$4,860/yr` (84%)** |
+| **Growth Team** (40 devs) | 200k 4-vCPU min/mo | `$2,400/mo` | `$1,600/mo` | **`~$315/mo`** | **`~$25,020/yr` (87%)** |
+| **Monorepo Scale** (150 devs) | 500k 8-vCPU min/mo | `$11,000/mo` *(at `$0.022/min`)* | `$8,000/mo` *(at `$0.016/min`)* | **`~$1,450/mo`** | **`~$114,600/yr` (87%)** |
+
+### Measured Monorepo Speedup
+
+20-shard TypeScript & Playwright monorepo running on **4–8 vCPU GCP Spot** via `open-ci` vs. **2-vCPU managed runners**:
+
+| Test Suite | 2-vCPU Managed | **`open-ci` (4–8 vCPU Spot)** | Speedup |
+| --- | ---: | ---: | ---: |
+| API integration tests (10 shards) | `10m 33s` | **`5m 47s`** | **45% faster** |
+| Portal integration suite | `8m 33s` | **`4m 41s`** | **45% faster** |
+| Playwright browser E2E (8 shards) | `8m 05s` | **`5m 51s`** | **28% faster** |
+| Developer API suite | `3m 10s` | **`2m 32s`** | **20% faster** |
+| Leaked Spot VMs after completion | — | **`0`** | — |
+
+---
+
+## How `open-ci` Compares
+
+| Capability | **`open-ci`** | GitHub-Hosted | Managed Runner SaaS | Kubernetes ARC |
+| --- | --- | --- | --- | --- |
+| **License** | **Apache-2.0 (100% OSS)** | Proprietary | Proprietary | Apache-2.0 |
+| **4-vCPU Linux Cost** | **`~$0.0012–$0.0014/min`** | `$0.012/min` | `$0.008/min` | Cloud cost + K8s cluster |
+| **Cloud Support** | **AWS + GCP (multi-cloud)** | GitHub only | Vendor cloud | Any K8s cluster |
+| **Infra Required** | **1 small VM (`~$15/mo`)** | None | None | Full Kubernetes cluster + ops |
+| **Built-in Actions v2 Cache** | **Yes (NVMe / S3 / R2 / GCS)** | 10 GiB limit / billed | Proprietary add-on | DIY |
+| **VM Isolation & Zero IAM** | **Fresh VM per job, zero IAM** | Fresh VM per job | Shared vendor plane | Shared node kernel (pods) |
+| **Fail-Closed Fallback** | **Built-in (`actions/route`)** | N/A | Manual | Manual |
+| **Burns AWS / GCP Credits** | **Yes** | No | No | Yes |
+
+---
+
+## How It Works
+
+```mermaid
+flowchart LR
+    GH["GitHub Actions"] -->|"workflow_job webhook or OIDC JWT"| CP["open-ci Control Plane (Rust / Axum / SQLite)"]
+    CP -->|"EC2 SigV4 / Compute Engine REST"| VM["Ephemeral Spot / On-Demand VMs (Zero IAM, Auto-NVMe)"]
+    VM -->|"Single-use HMAC bootstrap -> JIT config"| CP
+    VM -->|"Actions Cache v2 (Twirp + Blob)"| CACHE["open-ci cache (Local NVMe, S3/R2, or GCS)"]
+    VM -->|"Outbound HTTPS only"| GH
+    OP["Operator CLI / Prometheus / SSE"] -->|"Private loopback or VPN + Bearer"| CP
+```
+
+### Deploy to Production
+
+Ready for AWS, GCP, or multi-cloud failover? Turnkey modules and release artifacts are included:
+
+- **Prebuilt binaries & AWS janitor Lambda zips:** [`github.com/katchlabs/open-ci/releases/latest`](https://github.com/katchlabs/open-ci/releases/latest) (`x86_64` & `aarch64` Linux)
+- **Terraform modules (`infra/terraform`):** [`aws-controller`](infra/terraform/examples/aws-controller/main.tf), [`gcp-quickstart`](infra/terraform/examples/gcp-quickstart/main.tf), and [`multi-cloud`](infra/terraform/examples/multi-cloud/main.tf) (with keyless GCP→AWS web identity federation)
+- **Packer runner images (`infra/packer`):** Unified Ubuntu 24.04 `x64`/`arm64` template with pinned `actions/runner`, Docker BuildKit, sysctl tuning, and boot-time auto-NVMe RAID0
+- **Step-by-step guide:** Follow the [**Deployment Quickstart**](docs/quickstart.md)
+
+---
+
+## Honest Tradeoffs & Non-Goals
+
+We prefer clear engineering boundaries over marketing claims:
+
+- **Single-node SQLite control plane today.** `open-ci-store` uses SQLite in WAL mode with `fs2` single-writer fencing and online snapshots. One small controller VM (`t4g.small` / `e2-small`) comfortably drives hundreds of concurrent runners, and fail-closed `actions/route` keeps CI green during controller maintenance — active-active multi-node HA awaits the planned `PostgresStore`.
+- **Linux runners only today.** Packer images and `open-ci agent bootstrap` target `x86_64` and `aarch64` Ubuntu Linux VMs. macOS and Windows runners are out of scope for now.
+- **When GitHub-hosted is simpler.** If your CI bill is small, standard runners are fast enough, and you don't need private VPC access, Spot instances, local NVMe scratch disks, or self-hosted Actions v2 caching, GitHub-hosted runners have zero operational overhead.
+- **Purpose-built for GitHub Actions.** `open-ci` orchestrates ephemeral VM fleets for GitHub Actions — it is not a general-purpose batch scheduler or Kubernetes replacement.
+
+---
+
+## Roadmap
+
+| Status | Milestone | Details |
+| :---: | --- | --- |
+| ✓ | Multi-cloud AWS + GCP Spot & On-Demand | Pure-Rust SigV4/XML EC2 + Compute Engine REST |
+| ✓ | Org-wide & multi-repo runner pools | `organization`, `allowed_repositories`, `runner_group_id` |
+| ✓ | `webhook`, `oidc`, and `hybrid` admission | Drop-in webhooks or fail-closed `actions/route@v0.1.1` |
+| ✓ | Native Actions Cache v2 (`open-ci cache`) | Local NVMe, S3/R2/MinIO, native GCS; verified with `@actions/cache` |
+| ✓ | Auto-NVMe RAID0/ext4 & BuildKit tuning | `x64` & `arm64` Ubuntu 24.04 Packer templates |
+| ✓ | Keyless BYOC cloud identity | `IMDSv2`, STS `AssumeRole` + `ExternalId`, GCE metadata, SA impersonation, GCP→AWS federation |
+| ✓ | Turnkey Terraform & multi-arch releases | `aws-controller`, `gcp-controller`, GHCR + `.tar.gz` + Lambda zips |
+| ○ | `PostgresStore` for active-active HA | Same async `Store` trait; zero domain changes |
+| ○ | Operator Web UI | Backed by existing `/api/v1/*` REST + `/api/v1/events` SSE |
+| ○ | Additional cloud providers | Hetzner, Azure, Kubernetes via `CloudProvider` trait |
+| ○ | Interactive `open-ci init` setup wizard | Generates validated `open-ci.toml` and trust policies |
+
+---
+
+<details>
+<summary><strong>Workspace &amp; Infrastructure Map (11 Rust Crates + IaC)</strong></summary>
 
 | Path | Responsibility |
 | --- | --- |
 | `crates/open-ci-core` | Zero-I/O domain core: typed TOML config + validation, worker state machine, admission capacity math, placement selection, regional quota backoff, `SecretString`, `Clock`. |
 | `crates/open-ci-store` | Async `Store` trait and non-blocking normalized `SQLite` backend (`spawn_blocking`, WAL, `0o600` pre-creation, `fs2` exclusive lockfile, online backup snapshots). |
 | `crates/open-ci-provider` | Cloud-agnostic `CloudProvider` trait, typed `ProviderError`, `InstanceSpec`, and `ProviderRegistry`. |
-| `crates/open-ci-provider-aws` | Pure-Rust AWS EC2 + STS adapter (SigV4 signing, XML parsing, Spot/On-Demand, IMDSv2, cross-account `AssumeRole` with `ExternalId`). |
+| `crates/open-ci-provider-aws` | Pure-Rust AWS EC2 + STS adapter (SigV4 signing, XML parsing, Spot/On-Demand, IMDSv2, cross-account `AssumeRole` with `ExternalId`, GCP→AWS web identity). |
 | `crates/open-ci-provider-gcp` | Native Rust GCP Compute Engine REST adapter (Spot/On-Demand, `maxRunDuration`, `serviceAccounts: []`, GCE metadata & IAM impersonation). |
 | `crates/open-ci-provider-mock` | Deterministic fault-injecting provider for tests and `open-ci demo`. |
 | `crates/open-ci-github` | Typed GitHub REST client (bounded pagination, repo & org JIT registration), constant-time HMAC webhook verifier, RS256 OIDC JWT verifier, privilege-separated credential broker. |
@@ -186,34 +293,7 @@ jobs:
 | `infra/packer` | Unified GCP + AWS Packer template (`ubuntu-runner.pkr.hcl`) for `x64`/`arm64` Ubuntu 24.04 runners with boot-time auto-NVMe (`setup-nvme.sh`), Docker BuildKit, and sysctl tuning. |
 | `deploy/` | Hardened systemd units (`open-ci.service`, `open-ci-cache.service`, `open-ci-credentials.timer`, `open-ci-backup.timer`), Caddy reverse proxy template, and multi-stage Dockerfile. |
 
----
-
-## Transparent Tradeoffs & Non-Goals
-
-We prefer clear engineering boundaries over marketing claims:
-
-- **Single-node SQLite control plane today.** `open-ci-store` uses SQLite in WAL mode with an exclusive `fs2` lockfile and hourly online backups. One small controller VM (`t4g.small` / `e2-small`) comfortably handles hundreds of concurrent runners, and fail-closed `actions/route` handles controller downtime without breaking CI — but active-active multi-node HA requires the planned `PostgresStore`.
-- **Linux runners only today.** Packer templates and `open-ci agent bootstrap` target `x86_64` and `aarch64` Ubuntu Linux VMs. macOS and Windows runners are out of scope for now.
-- **When GitHub-hosted runners are simpler.** If your CI bill is low, your builds fit comfortably on standard 4-core runners, and you do not need private VPC access, large Spot instances, NVMe scratch disks, or self-hosted Actions v2 caching, standard GitHub-hosted runners have zero operational overhead.
-- **Not a generic job orchestrator.** `open-ci` manages ephemeral VM fleets for GitHub Actions. It does not replace Kubernetes, Nomad, or general batch schedulers.
-
----
-
-## Roadmap
-
-| Status | Milestone | Notes |
-| :---: | --- | --- |
-| ✓ | Multi-cloud AWS + GCP Spot & On-Demand provisioning | Pure-Rust SigV4/XML EC2 + Compute Engine REST |
-| ✓ | Org-level & multi-repo runner pools | `organization`, `allowed_repositories`, `runner_group_id` |
-| ✓ | `webhook`, `oidc`, and `hybrid` admission modes | Drop-in webhooks or fail-closed `actions/route` |
-| ✓ | Native GitHub Actions v2 transparent cache (`open-ci cache`) | Local NVMe, native S3 / R2 / MinIO, and native GCS; verified with the official `@actions/cache` client |
-| ✓ | Auto-NVMe RAID0/ext4 boot setup & BuildKit tuning | `x64` and `arm64` Ubuntu 24.04 Packer images |
-| ✓ | BYOC cross-account AWS `AssumeRole` & GCP SA impersonation | `ExternalId` support, EC2 IMDSv2, GCE metadata, keyless GCP→AWS web identity |
-| ✓ | Turnkey Terraform modules & automated multi-arch releases | `aws-controller`, `gcp-controller`, GHCR + `.tar.gz` |
-| ○ | `PostgresStore` implementation for active-active HA | Same async `Store` trait; zero domain changes |
-| ○ | Operator Web UI | Backed by existing `/api/v1/*` REST + `/api/v1/events` SSE |
-| ○ | Additional cloud providers (Hetzner, Azure, Kubernetes) | Via `open-ci-provider` `CloudProvider` trait |
-| ○ | Interactive `open-ci init` setup wizard | Generates validated `open-ci.toml` and trust policies |
+</details>
 
 ---
 
@@ -222,10 +302,10 @@ We prefer clear engineering boundaries over marketing claims:
 - [**Deployment Quickstart**](docs/quickstart.md) — End-to-end AWS-only, GCP-only, or multi-cloud deployment with Terraform, Packer, systemd, and Caddy.
 - [**Architecture Guide**](docs/architecture.md) — Hexagonal crate layout, concurrency model, SQLite durability, multi-cloud scheduling, cache/NVMe pipeline, and exact HTTP API specification.
 - [**Security & Threat Model**](docs/security.md) — Zero-IAM runners, atomic single-use bootstrap, OIDC pinning, credential broker isolation, triple-layer expiry, and BYOC trust boundaries.
-- [**Engineering & Trust Loop**](docs/engineering.md) — How `open-ci` is engineered and verified: the Pyramid of Trust, `.agents/skills/`, reusable runtime + SQLite driver, and the 7-gate `./scripts/verify.sh` proof ladder.
-- [**Contributing**](CONTRIBUTING.md) — Standards, local verification, and PR workflow for human and AI contributors.
+- [**Engineering & Trust Loop**](docs/engineering.md) — Pyramid of Trust, `.agents/skills/`, reusable runtime + SQLite driver, and the 7-gate `./scripts/verify.sh` proof ladder.
+- [**Contributing**](CONTRIBUTING.md) — Standards, local verification, and PR workflow.
 - [**Security Policy**](SECURITY.md) — Private vulnerability disclosure process.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Built by [Katch Labs](https://github.com/katchlabs). Licensed under the [Apache License, Version 2.0](LICENSE).

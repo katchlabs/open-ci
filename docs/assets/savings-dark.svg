@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 344" width="920" height="344" role="img" aria-label="open-ci cost savings and monorepo speedup chart">
+  <defs>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    </style>
+    <linearGradient id="bar-win-dark" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2ea043"/>
+      <stop offset="100%" stop-color="#3fb950"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Outer Card -->
+  <rect x="1" y="1" width="918" height="342" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+
+  <!-- Center Divider -->
+  <line x1="460" y1="24" x2="460" y2="320" stroke="#21262d" stroke-width="1.5"/>
+
+  <!-- ==================== LEFT PANEL: MONTHLY COST ==================== -->
+  <text x="28" y="42" class="sans" font-size="11.5" font-weight="700" letter-spacing="0.9" fill="#fb923c">MONTHLY CI COST (40-DEV TEAM)</text>
+  <text x="28" y="61" class="sans" font-size="12.5" fill="#8b949e">200,000 4-vCPU Linux min/mo · All-in estimate</text>
+
+  <!-- Row 1: GitHub Actions -->
+  <text x="28" y="102" class="sans" font-size="13" font-weight="600" fill="#c9d1d9">GitHub Actions</text>
+  <text x="136" y="102" class="mono" font-size="11.5" fill="#8b949e">$0.012/min</text>
+  <text x="432" y="102" text-anchor="end" class="mono" font-size="13" font-weight="600" fill="#c9d1d9">$2,400/mo</text>
+  <rect x="28" y="112" width="404" height="22" rx="5" fill="#161b22"/>
+  <rect x="28" y="112" width="404" height="22" rx="5" fill="#484f58"/>
+
+  <!-- Row 2: Managed Runners -->
+  <text x="28" y="164" class="sans" font-size="13" font-weight="600" fill="#c9d1d9">Managed SaaS Runners</text>
+  <text x="192" y="164" class="mono" font-size="11.5" fill="#8b949e">$0.008/min</text>
+  <text x="432" y="164" text-anchor="end" class="mono" font-size="13" font-weight="600" fill="#c9d1d9">$1,600/mo</text>
+  <rect x="28" y="174" width="404" height="22" rx="5" fill="#161b22"/>
+  <rect x="28" y="174" width="269" height="22" rx="5" fill="#6e7681"/>
+
+  <!-- Row 3: open-ci -->
+  <text x="28" y="226" class="sans" font-size="13.5" font-weight="700" fill="#f0f6fc">open-ci</text>
+  <text x="88" y="226" class="mono" font-size="11.5" fill="#3fb950">AWS / GCP Spot · $0.0012–$0.0014/min</text>
+  <rect x="28" y="236" width="404" height="26" rx="5" fill="#161b22"/>
+  <rect x="28" y="236" width="53" height="26" rx="5" fill="url(#bar-win-dark)"/>
+  <text x="92" y="254" class="mono" font-size="14" font-weight="700" fill="#f0f6fc">~$315/mo</text>
+  <rect x="172" y="239" width="156" height="20" rx="10" fill="#12261e" stroke="#2ea043" stroke-width="1"/>
+  <text x="250" y="253" text-anchor="middle" class="mono" font-size="11" font-weight="700" fill="#3fb950">−87% · Save $25k/yr</text>
+
+  <!-- Left Footer Box -->
+  <rect x="28" y="284" width="404" height="36" rx="7" fill="#161b22" stroke="#21262d" stroke-width="1"/>
+  <text x="42" y="306" class="sans" font-size="12" fill="#8b949e">Includes <tspan font-weight="600" fill="#c9d1d9">~$15/mo</tspan> controller + boot disks · Burns cloud credits</text>
+
+  <!-- ==================== RIGHT PANEL: REAL-WORLD SPEEDUP ==================== -->
+  <text x="488" y="42" class="sans" font-size="11.5" font-weight="700" letter-spacing="0.9" fill="#3fb950">MEASURED MONOREPO SPEEDUP</text>
+  <text x="488" y="61" class="sans" font-size="12.5" fill="#8b949e">20-shard TS &amp; Playwright · 4–8 vCPU Spot vs 2-vCPU managed</text>
+
+  <!-- Suite 1: API Integration -->
+  <text x="488" y="96" class="sans" font-size="12.5" font-weight="600" fill="#c9d1d9">API integration (10 shards)</text>
+  <text x="892" y="96" text-anchor="end" class="mono" font-size="11.5" fill="#8b949e">10m 33s → <tspan font-weight="700" fill="#f0f6fc">5m 47s</tspan>  <tspan font-weight="700" fill="#3fb950">−45%</tspan></text>
+  <rect x="488" y="104" width="404" height="6" rx="3" fill="#484f58"/>
+  <rect x="488" y="113" width="221" height="8" rx="4" fill="url(#bar-win-dark)"/>
+
+  <!-- Suite 2: Portal Integration -->
+  <text x="488" y="146" class="sans" font-size="12.5" font-weight="600" fill="#c9d1d9">Portal integration</text>
+  <text x="892" y="146" text-anchor="end" class="mono" font-size="11.5" fill="#8b949e">8m 33s → <tspan font-weight="700" fill="#f0f6fc">4m 41s</tspan>  <tspan font-weight="700" fill="#3fb950">−45%</tspan></text>
+  <rect x="488" y="154" width="327" height="6" rx="3" fill="#484f58"/>
+  <rect x="488" y="163" width="179" height="8" rx="4" fill="url(#bar-win-dark)"/>
+
+  <!-- Suite 3: Playwright E2E -->
+  <text x="488" y="196" class="sans" font-size="12.5" font-weight="600" fill="#c9d1d9">Playwright E2E (8 shards)</text>
+  <text x="892" y="196" text-anchor="end" class="mono" font-size="11.5" fill="#8b949e">8m 05s → <tspan font-weight="700" fill="#f0f6fc">5m 51s</tspan>  <tspan font-weight="700" fill="#3fb950">−28%</tspan></text>
+  <rect x="488" y="204" width="310" height="6" rx="3" fill="#484f58"/>
+  <rect x="488" y="213" width="224" height="8" rx="4" fill="url(#bar-win-dark)"/>
+
+  <!-- Suite 4: Developer API -->
+  <text x="488" y="246" class="sans" font-size="12.5" font-weight="600" fill="#c9d1d9">Developer API</text>
+  <text x="892" y="246" text-anchor="end" class="mono" font-size="11.5" fill="#8b949e">3m 10s → <tspan font-weight="700" fill="#f0f6fc">2m 32s</tspan>  <tspan font-weight="700" fill="#3fb950">−20%</tspan></text>
+  <rect x="488" y="254" width="121" height="6" rx="3" fill="#484f58"/>
+  <rect x="488" y="263" width="97" height="8" rx="4" fill="url(#bar-win-dark)"/>
+
+  <!-- Right Footer Box -->
+  <rect x="488" y="284" width="404" height="36" rx="7" fill="#161b22" stroke="#21262d" stroke-width="1"/>
+  <circle cx="506" cy="302" r="4" fill="#484f58"/>
+  <text x="516" y="306" class="sans" font-size="11.5" fill="#8b949e">2-vCPU managed</text>
+  <circle cx="630" cy="302" r="4" fill="#3fb950"/>
+  <text x="640" y="306" class="sans" font-size="11.5" font-weight="600" fill="#c9d1d9">open-ci Spot</text>
+  <text x="878" y="306" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#3fb950">0 leaked VMs</text>
+</svg>
