@@ -244,9 +244,18 @@ impl Placement {
 }
 
 impl PoolConfig {
+    /// Worst-case number of runner instances reserved when a workflow run uses this pool.
+    #[must_use]
+    pub const fn reserved_instances_per_run(&self) -> usize {
+        match self.max_instances_per_run {
+            Some(cap) => cap,
+            None => self.max_instances,
+        }
+    }
+
     /// Worst-case capacity envelope reserved when a workflow run uses this pool.
     pub fn capacity_footprint(&self) -> Result<Capacity, ConfigError> {
-        let per_run = self.max_instances_per_run.unwrap_or(self.max_instances);
+        let per_run = self.reserved_instances_per_run();
         let instances = u32::try_from(per_run)
             .map_err(|_| ConfigError::invalid("pools.max_instances_per_run", "exceeds u32"))?;
         let vcpu = self

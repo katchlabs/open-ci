@@ -1063,3 +1063,62 @@ async fn hybrid_mode_handles_both_explicit_scoped_and_direct_webhook_admissions(
     assert!(custom_labels.contains(&scoped_label));
     assert!(custom_labels.contains("open-ci-api"));
 }
+
+#[tokio::test]
+async fn admission_rejects_when_pool_lifetime_worker_cap_is_exhausted() {
+    let gh_state = Arc::new(Mutex::new(OrgFakeGitHubState::default()));
+    let gh_url = start_org_fake_github(Arc::clone(&gh_state)).await;
+    let harness = setup_org_harness(gh_url, AdmissionMode::Hybrid);
+    assert!(harness.is_some());
+    let Some(E2eHarness {
+        _dir, store, cp, ..
+    }) = harness
+    else {
+        return;
+    };
+
+    for idx in 0..9 {
+        let worker = open_ci_core::Worker {
+            name: format!("open-ci-api-prior-{idx}"),
+            pool_id: "api".to_owned(),
+            admission_id: None,
+            request_id: format!("req-prior-{idx}"),
+            provider: ProviderKind::Mock,
+            placement_index: 0,
+            region: "us-east1".to_owned(),
+            zone: "us-east1-a".to_owned(),
+            machine_type: "m-2".to_owned(),
+            provider_instance_id: Some(format!("mock-{idx}")),
+            phase: WorkerPhase::Gone,
+            create_operation: None,
+            delete_operation: None,
+            delete_attempts: 0,
+            bootstrap_used: true,
+            runner_id: None,
+            job_id: None,
+            retire_reason: Some("job_completed".to_owned()),
+            created_at: 1_000 + idx,
+            updated_at: 1_100 + idx,
+        };
+        assert!(store.upsert_worker(&worker).await.is_ok());
+    }
+
+    let decision = cp
+        .admit(&AdmissionRequest {
+            repository: "acme/service-a".to_owned(),
+            run_id: 999,
+            run_attempt: 1,
+            head_sha: "b".repeat(40),
+            pools: BTreeSet::from(["api".to_owned()]),
+        })
+        .await
+        .ok();
+    assert!(matches!(
+        decision,
+        Some(ref d)
+            if !d.admitted
+                && d.target == "fallback"
+                && d.reason == open_ci_core::AdmissionReason::LifetimeLimit
+                && d.runners.get("api").map(String::as_str) == Some("ubuntu-latest")
+    ));
+}

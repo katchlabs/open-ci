@@ -16,6 +16,7 @@ pub struct AdmissionContext {
     pub total_admitted_count: u32,
     pub utc_day_admitted_count: u32,
     pub providers_healthy: bool,
+    pub pool_launched_counts: BTreeMap<String, usize>,
 }
 
 /// Evaluates whether a workflow run should be admitted to `open-ci` capacity or
@@ -155,7 +156,25 @@ fn check_eligibility(
     {
         return Some(AdmissionReason::DailyLimit);
     }
+    if pool_lifetime_exhausted(config, ctx, request) {
+        return Some(AdmissionReason::LifetimeLimit);
+    }
     None
+}
+
+fn pool_lifetime_exhausted(
+    config: &OpenCiConfig,
+    ctx: &AdmissionContext,
+    request: &AdmissionRequest,
+) -> bool {
+    request.pools.iter().any(|pool_id| {
+        config.pools.get(pool_id).is_some_and(|pool| {
+            pool.max_total_instances.is_some_and(|cap| {
+                let launched = ctx.pool_launched_counts.get(pool_id).copied().unwrap_or(0);
+                cap.saturating_sub(launched) < pool.reserved_instances_per_run()
+            })
+        })
+    })
 }
 
 fn has_sufficient_capacity(

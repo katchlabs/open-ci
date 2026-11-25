@@ -142,6 +142,7 @@ proptest! {
             total_admitted_count: 0,
             utc_day_admitted_count: 0,
             providers_healthy: true,
+            pool_launched_counts: BTreeMap::new(),
         };
 
         for (step, is_admit) in ops.into_iter().enumerate() {
@@ -685,5 +686,37 @@ fn unlisted_bootstrapped_worker_is_lost_immediately() {
     assert!(missing_instance_is_lost(
         &live_worker(created, true),
         created
+    ));
+}
+
+#[test]
+fn admission_fails_closed_when_pool_max_total_instances_cannot_cover_run() {
+    let cfg = sample_config(64, 16, 1_000);
+    let req = AdmissionRequest {
+        repository: "acme/app".to_owned(),
+        run_id: 42,
+        run_attempt: 1,
+        head_sha: "a".repeat(40),
+        pools: BTreeSet::from(["api".to_owned()]),
+    };
+
+    let mut ctx_ok = AdmissionContext {
+        mode: ControlMode::Active,
+        providers_healthy: true,
+        pool_launched_counts: BTreeMap::from([("api".to_owned(), 16)]),
+        ..AdmissionContext::default()
+    };
+    let ok = evaluate_admission(&cfg, &ctx_ok, &req, "res-ok", 1_000).ok();
+    assert!(matches!(ok, Some(ref d) if d.admitted && d.reason == AdmissionReason::Admitted));
+
+    ctx_ok.pool_launched_counts.insert("api".to_owned(), 17);
+    let rejected = evaluate_admission(&cfg, &ctx_ok, &req, "res-cap", 1_000).ok();
+    assert!(matches!(
+        rejected,
+        Some(ref d)
+            if !d.admitted
+                && d.target == "fallback"
+                && d.reason == AdmissionReason::LifetimeLimit
+                && d.runners.get("api").map(String::as_str) == Some("ubuntu-latest")
     ));
 }

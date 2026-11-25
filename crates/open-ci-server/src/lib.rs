@@ -176,12 +176,26 @@ impl ControlPlane {
         let (total_admitted_count, utc_day_admitted_count) =
             self.store.count_admitted(utc_day_start).await?;
 
+        let mut pool_launched_counts = std::collections::BTreeMap::new();
+        for pool_id in &request.pools {
+            if self
+                .config
+                .pools
+                .get(pool_id)
+                .is_some_and(|pool| pool.max_total_instances.is_some())
+            {
+                let launched = self.store.count_pool_workers(pool_id).await?;
+                pool_launched_counts.insert(pool_id.clone(), launched);
+            }
+        }
+
         let ctx = AdmissionContext {
             mode: control_state.mode,
             held_admissions,
             total_admitted_count,
             utc_day_admitted_count,
             providers_healthy,
+            pool_launched_counts,
         };
 
         let reservation_id = format!("open-ci-{}", Uuid::new_v4().simple());
