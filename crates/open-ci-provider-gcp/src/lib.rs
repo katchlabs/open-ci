@@ -24,7 +24,32 @@ use open_ci_provider::{
 };
 use reqwest::{Client, Method, StatusCode};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+const MAX_LIST_PAGES: usize = 50;
+
+/// Raw GCP Compute Engine instance metadata returned by `list_managed_instances`
+/// (including `open-ci-expires-at` and `open-ci-tenant` labels for expiry janitors).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GcpManagedInstance {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub creation_timestamp: Option<String>,
+    pub labels: BTreeMap<String, String>,
+}
+
+/// Raw GCP Compute Engine disk metadata returned by `list_managed_disks`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GcpManagedDisk {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub attached: bool,
+    pub creation_timestamp: Option<String>,
+    pub labels: BTreeMap<String, String>,
+}
 
 #[derive(Debug)]
 pub struct GcpProvider {
@@ -90,17 +115,156 @@ impl GcpProvider {
             .map_err(|_| ProviderError::Transient("invalid gcp json response".to_owned()))?;
         Ok(Some(parsed))
     }
+
+    /// Lists managed GCE instances in `zone` across all pages (`nextPageToken`, bounded to 50 pages),
+    /// optionally filtered by `pool_id` and `tenant_id`.
+    pub async fn list_managed_instances(
+        &self,
+        zone: &str,
+        pool_id: Option<&str>,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<GcpManagedInstance>, ProviderError> {
+        validate_path_segment("project", &self.config.project)?;
+        validate_path_segment("zone", zone)?;
+        if let Some(pool) = pool_id {
+            validate_gcp_label_value("pool_id", pool)?;
+        }
+        if let Some(tenant) = tenant_id.filter(|t| !t.is_empty()) {
+            validate_gcp_label_value("tenant_id", tenant)?;
+        }
+
+        let filter = build_label_filter(pool_id, tenant_id);
+        let base_path = format!("/projects/{}/zones/{zone}/instances", self.config.project);
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        for _ in 0..MAX_LIST_PAGES {
+            let path = build_paginated_list_path(&base_path, &filter, page_token.as_deref())?;
+            let Some(list): Option<GcpListDto<GcpInstanceDto>> =
+                self.request_json(Method::GET, &path, None, None).await?
+            else {
+                break;
+            };
+            for item in list.items {
+                if !matches_managed_labels(&item.labels, pool_id, tenant_id) {
+                    continue;
+                }
+                let id = if item.id.is_empty() {
+                    item.name.clone()
+                } else {
+                    item.id
+                };
+                out.push(GcpManagedInstance {
+                    id,
+                    name: item.name,
+                    status: item.status,
+                    creation_timestamp: item.creation_timestamp,
+                    labels: item.labels,
+                });
+            }
+            page_token = list.next_page_token.filter(|t| !t.is_empty());
+            if page_token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Lists managed GCE disks in `zone` across all pages (`nextPageToken`, bounded to 50 pages),
+    /// optionally filtered by `pool_id` and `tenant_id`.
+    pub async fn list_managed_disks(
+        &self,
+        zone: &str,
+        pool_id: Option<&str>,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<GcpManagedDisk>, ProviderError> {
+        validate_path_segment("project", &self.config.project)?;
+        validate_path_segment("zone", zone)?;
+        if let Some(pool) = pool_id {
+            validate_gcp_label_value("pool_id", pool)?;
+        }
+        if let Some(tenant) = tenant_id.filter(|t| !t.is_empty()) {
+            validate_gcp_label_value("tenant_id", tenant)?;
+        }
+
+        let filter = build_label_filter(pool_id, tenant_id);
+        let base_path = format!("/projects/{}/zones/{zone}/disks", self.config.project);
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        for _ in 0..MAX_LIST_PAGES {
+            let path = build_paginated_list_path(&base_path, &filter, page_token.as_deref())?;
+            let Some(list): Option<GcpListDto<GcpDiskDto>> =
+                self.request_json(Method::GET, &path, None, None).await?
+            else {
+                break;
+            };
+            for item in list.items {
+                if !matches_managed_labels(&item.labels, pool_id, tenant_id) {
+                    continue;
+                }
+                let id = if item.id.is_empty() {
+                    item.name.clone()
+                } else {
+                    item.id
+                };
+                out.push(GcpManagedDisk {
+                    id,
+                    name: item.name,
+                    status: item.status,
+                    attached: !item.users.is_empty(),
+                    creation_timestamp: item.creation_timestamp,
+                    labels: item.labels,
+                });
+            }
+            page_token = list.next_page_token.filter(|t| !t.is_empty());
+            if page_token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }
 
-fn validate_gcp_label_value(pool_id: &str) -> Result<(), ProviderError> {
-    if pool_id.is_empty()
-        || !pool_id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+fn build_label_filter(pool_id: Option<&str>, tenant_id: Option<&str>) -> String {
+    let mut clauses = vec!["labels.open-ci-managed=true".to_owned()];
+    if let Some(pool) = pool_id {
+        clauses.push(format!("labels.open-ci-pool={pool}"));
+    }
+    if let Some(tenant) = tenant_id.filter(|t| !t.is_empty()) {
+        clauses.push(format!("labels.open-ci-tenant={tenant}"));
+    }
+    clauses.join(" AND ")
+}
+
+fn build_paginated_list_path(
+    base_path: &str,
+    filter: &str,
+    page_token: Option<&str>,
+) -> Result<String, ProviderError> {
+    let mut url = reqwest::Url::parse(&format!("https://compute.invalid{base_path}"))
+        .map_err(|_| ProviderError::InvalidConfig("invalid gcp list path".to_owned()))?;
     {
-        return Err(ProviderError::InvalidConfig(
-            "pool_id contains unsafe characters for GCP label filter".to_owned(),
-        ));
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("filter", filter);
+        if let Some(token) = page_token {
+            qp.append_pair("pageToken", token);
+        }
+    }
+    let query = url.query().unwrap_or("");
+    Ok(format!("{base_path}?{query}"))
+}
+
+fn validate_gcp_label_value(field: &str, value: &str) -> Result<(), ProviderError> {
+    if value.is_empty()
+        || value.len() > 63
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+    {
+        return Err(ProviderError::InvalidConfig(format!(
+            "{field} contains unsafe characters for GCP label"
+        )));
     }
     Ok(())
 }
@@ -121,9 +285,25 @@ fn validate_path_segment(name: &str, value: &str) -> Result<(), ProviderError> {
     Ok(())
 }
 
-fn is_managed_for_pool(labels: &std::collections::BTreeMap<String, String>, pool_id: &str) -> bool {
-    labels.get("open-ci-managed").is_some_and(|v| v == "true")
-        && labels.get("open-ci-pool").is_some_and(|p| p == pool_id)
+fn matches_managed_labels(
+    labels: &BTreeMap<String, String>,
+    pool_id: Option<&str>,
+    tenant_id: Option<&str>,
+) -> bool {
+    if labels.get("open-ci-managed").is_none_or(|v| v != "true") {
+        return false;
+    }
+    if let Some(pool) = pool_id
+        && labels.get("open-ci-pool").is_none_or(|p| p != pool)
+    {
+        return false;
+    }
+    if let Some(tenant) = tenant_id.filter(|t| !t.is_empty())
+        && labels.get("open-ci-tenant").is_none_or(|t| t != tenant)
+    {
+        return false;
+    }
+    true
 }
 
 #[async_trait]
@@ -176,35 +356,19 @@ impl CloudProvider for GcpProvider {
         placement: &Placement,
         pool_id: &str,
     ) -> Result<Vec<CloudInstance>, ProviderError> {
-        validate_path_segment("project", &self.config.project)?;
-        validate_path_segment("zone", &placement.zone)?;
-        validate_gcp_label_value(pool_id)?;
-        let path = format!(
-            "/projects/{}/zones/{}/instances?filter=labels.open-ci-managed%3Dtrue%20AND%20labels.open-ci-pool%3D{pool_id}",
-            self.config.project, placement.zone
-        );
-        let list: Option<GcpListDto<GcpInstanceDto>> = self
-            .request_json(Method::GET, &path, None, Some(placement))
+        let items = self
+            .list_managed_instances(&placement.zone, Some(pool_id), None)
             .await?;
-        Ok(list
-            .map(|l| {
-                l.items
-                    .into_iter()
-                    .filter(|i| is_managed_for_pool(&i.labels, pool_id))
-                    .map(|i| CloudInstance {
-                        provider_id: if i.id.is_empty() {
-                            i.name.clone()
-                        } else {
-                            i.id
-                        },
-                        name: i.name,
-                        pool_id: pool_id.to_owned(),
-                        status: map_instance_status(&i.status),
-                        zone: placement.zone.clone(),
-                    })
-                    .collect()
+        Ok(items
+            .into_iter()
+            .map(|i| CloudInstance {
+                provider_id: i.id,
+                name: i.name,
+                pool_id: pool_id.to_owned(),
+                status: map_instance_status(&i.status),
+                zone: placement.zone.clone(),
             })
-            .unwrap_or_default())
+            .collect())
     }
 
     async fn list_disks(
@@ -212,41 +376,28 @@ impl CloudProvider for GcpProvider {
         placement: &Placement,
         pool_id: &str,
     ) -> Result<Vec<CloudDisk>, ProviderError> {
-        validate_path_segment("project", &self.config.project)?;
-        validate_path_segment("zone", &placement.zone)?;
-        validate_gcp_label_value(pool_id)?;
-        let path = format!(
-            "/projects/{}/zones/{}/disks?filter=labels.open-ci-managed%3Dtrue%20AND%20labels.open-ci-pool%3D{pool_id}",
-            self.config.project, placement.zone
-        );
-        let list: Option<GcpListDto<GcpDiskDto>> = self
-            .request_json(Method::GET, &path, None, Some(placement))
+        let items = self
+            .list_managed_disks(&placement.zone, Some(pool_id), None)
             .await?;
-        Ok(list
-            .map(|l| {
-                l.items
-                    .into_iter()
-                    .filter(|d| is_managed_for_pool(&d.labels, pool_id))
-                    .map(|d| CloudDisk {
-                        provider_id: if d.id.is_empty() {
-                            d.name.clone()
-                        } else {
-                            d.id
-                        },
-                        name: d.name,
-                        pool_id: pool_id.to_owned(),
-                        attached: !d.users.is_empty(),
-                        status: d.status,
-                    })
-                    .collect()
+        Ok(items
+            .into_iter()
+            .map(|d| CloudDisk {
+                provider_id: d.id,
+                name: d.name,
+                pool_id: pool_id.to_owned(),
+                attached: d.attached,
+                status: d.status,
             })
-            .unwrap_or_default())
+            .collect())
     }
 
     async fn create_instance(&self, spec: &InstanceSpec) -> Result<CreateReceipt, ProviderError> {
         validate_path_segment("project", &self.config.project)?;
         validate_path_segment("zone", &spec.placement.zone)?;
         validate_path_segment("request_id", &spec.request_id)?;
+        if let Some(tenant) = spec.tenant_id.as_deref().filter(|t| !t.is_empty()) {
+            validate_gcp_label_value("tenant_id", tenant)?;
+        }
         let path = format!(
             "/projects/{}/zones/{}/instances?requestId={}",
             self.config.project, spec.placement.zone, spec.request_id

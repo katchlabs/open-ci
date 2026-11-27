@@ -101,6 +101,36 @@ impl StsAssumeRoleCredentials {
         }
     }
 
+    /// Creates a two-hop credential source for GCP-hosted control planes:
+    /// GCE OIDC -> AWS hub role (`AssumeRoleWithWebIdentity`) -> target customer role (`AssumeRole` + `ExternalId`).
+    pub fn over_gce_web_identity(
+        hub_config: crate::credentials::WebIdentityConfig,
+        target_config: AssumeRoleConfig,
+        client: Client,
+    ) -> Self {
+        Self::over_gce_web_identity_with_clock(
+            hub_config,
+            target_config,
+            client,
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// Creates a two-hop GCE-to-AWS-hub-to-customer credential source with an injectable clock.
+    pub fn over_gce_web_identity_with_clock(
+        hub_config: crate::credentials::WebIdentityConfig,
+        target_config: AssumeRoleConfig,
+        client: Client,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let hub = Arc::new(crate::credentials::GceWebIdentityCredentials::with_clock(
+            client.clone(),
+            hub_config,
+            Arc::clone(&clock),
+        ));
+        Self::with_clock(hub, client, target_config, clock)
+    }
+
     fn validate_config(&self) -> Result<(), ProviderError> {
         if self.config.role_arn.trim().is_empty() {
             return Err(ProviderError::InvalidConfig(

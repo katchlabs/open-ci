@@ -164,6 +164,7 @@ impl ControlPlane {
             lifetime_seconds,
             expires_at_unix: now.saturating_add(lifetime_seconds),
             user_data,
+            tenant_id: None,
         };
 
         match provider.create_instance(&spec).await {

@@ -165,6 +165,14 @@ fn append_resource_tags(params: &mut Vec<(&'static str, String)>, spec: &Instanc
             "open-ci-expires-at".to_owned(),
         ),
         ("TagSpecification.1.Tag.4.Value", expires.clone()),
+    ]);
+    if let Some(tenant) = spec.tenant_id.as_deref().filter(|t| !t.is_empty()) {
+        params.extend([
+            ("TagSpecification.1.Tag.5.Key", "open-ci-tenant".to_owned()),
+            ("TagSpecification.1.Tag.5.Value", tenant.to_owned()),
+        ]);
+    }
+    params.extend([
         ("TagSpecification.2.ResourceType", "volume".to_owned()),
         ("TagSpecification.2.Tag.1.Key", "Name".to_owned()),
         ("TagSpecification.2.Tag.1.Value", spec.worker_name.clone()),
@@ -178,4 +186,10 @@ fn append_resource_tags(params: &mut Vec<(&'static str, String)>, spec: &Instanc
         ),
         ("TagSpecification.2.Tag.4.Value", expires),
     ]);
+    if let Some(tenant) = spec.tenant_id.as_deref().filter(|t| !t.is_empty()) {
+        params.extend([
+            ("TagSpecification.2.Tag.5.Key", "open-ci-tenant".to_owned()),
+            ("TagSpecification.2.Tag.5.Value", tenant.to_owned()),
+        ]);
+    }
 }

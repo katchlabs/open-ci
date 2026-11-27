@@ -123,6 +123,7 @@ async fn gcp_adapter_supports_spot_and_ondemand_and_detects_quota_errors() {
                     lifetime_seconds: 1800,
                     expires_at_unix: 2000,
                     user_data: "#!/bin/sh\n".to_owned(),
+                    tenant_id: None,
                 })
                 .await;
             assert!(receipt.is_ok());
@@ -137,6 +138,7 @@ async fn gcp_adapter_supports_spot_and_ondemand_and_detects_quota_errors() {
                     lifetime_seconds: 1800,
                     expires_at_unix: 2000,
                     user_data: "#!/bin/sh\n".to_owned(),
+                    tenant_id: None,
                 })
                 .await;
             assert!(ondemand_receipt.is_ok());
@@ -168,6 +170,7 @@ fn instance_spec(worker_name: &str, request_id: &str, placement: Placement) -> I
         lifetime_seconds: 1800,
         expires_at_unix: 2000,
         user_data: "#!/bin/sh\n".to_owned(),
+        tenant_id: None,
     }
 }
 
@@ -261,4 +264,149 @@ async fn gcp_insert_wires_threads_per_core_local_ssds_and_network_bandwidth_tier
         assert_eq!(tuned_body["disks"][1], expected_ssd);
         assert_eq!(tuned_body["disks"][2], expected_ssd);
     }
+}
+
+fn build_paginated_gcp_router(captured_insert: Arc<Mutex<Vec<Value>>>) -> Router {
+    use axum::extract::RawQuery;
+
+    Router::new()
+        .route(
+            "/projects/demo/zones/us-central1-a/instances",
+            post(move |Json(body): Json<Value>| {
+                let capture = Arc::clone(&captured_insert);
+                async move {
+                    capture.lock().await.push(body);
+                    Json(json!({ "name": "op-tenant", "status": "RUNNING" }))
+                }
+            })
+            .get(|RawQuery(query): RawQuery| async move {
+                let q = query.unwrap_or_default();
+                let (next_page, id, name) = if q.contains("pageToken=p2") {
+                    (None, "2", "open-ci-default-2")
+                } else {
+                    (Some("p2"), "1", "open-ci-default-1")
+                };
+                let mut payload = json!({
+                    "items": [{
+                        "id": id,
+                        "name": name,
+                        "status": "RUNNING",
+                        "creationTimestamp": "2026-11-27T12:00:00.000-07:00",
+                        "labels": {
+                            "open-ci-managed": "true",
+                            "open-ci-pool": "default",
+                            "open-ci-tenant": "tenant_acme",
+                            "open-ci-expires-at": "2000"
+                        }
+                    }]
+                });
+                if let Some(tok) = next_page {
+                    payload["nextPageToken"] = json!(tok);
+                }
+                Json(payload)
+            }),
+        )
+        .route(
+            "/projects/demo/zones/us-central1-a/disks",
+            get(|RawQuery(query): RawQuery| async move {
+                let q = query.unwrap_or_default();
+                let (next_page, id, name, users) = if q.contains("pageToken=d2") {
+                    (None, "d-2", "open-ci-default-2", json!([]))
+                } else {
+                    (
+                        Some("d2"),
+                        "d-1",
+                        "open-ci-default-1",
+                        json!(["projects/demo/zones/us-central1-a/instances/open-ci-default-1"]),
+                    )
+                };
+                let mut payload = json!({
+                    "items": [{
+                        "id": id,
+                        "name": name,
+                        "status": "READY",
+                        "labels": {
+                            "open-ci-managed": "true",
+                            "open-ci-pool": "default",
+                            "open-ci-tenant": "tenant_acme"
+                        },
+                        "users": users
+                    }]
+                });
+                if let Some(tok) = next_page {
+                    payload["nextPageToken"] = json!(tok);
+                }
+                Json(payload)
+            }),
+        )
+}
+
+#[tokio::test]
+async fn gcp_paginates_managed_resources_and_sets_expiry_and_tenant_labels() {
+    let captured_insert = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let app = build_paginated_gcp_router(Arc::clone(&captured_insert));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.ok();
+    assert!(listener.is_some());
+    let Some(listener) = listener else { return };
+    let addr = listener.local_addr().ok();
+    assert!(addr.is_some());
+    let Some(addr) = addr else { return };
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let provider = GcpProvider::new(
+        GcpProviderConfig {
+            project: "demo".to_owned(),
+            compute_url: format!("http://{addr}"),
+            image: "projects/demo/global/images/runner-v1".to_owned(),
+            external_ipv4: false,
+            network_tier: "PREMIUM".to_owned(),
+            network_tags: vec!["open-ci-worker".to_owned()],
+            impersonate_service_account: None,
+        },
+        Client::new(),
+        Arc::new(StaticTokenSource(SecretString::new("tok"))),
+    );
+
+    let mut spec = instance_spec("open-ci-default-1", "req-t-1", test_placement(true));
+    spec.tenant_id = Some("tenant_acme".to_owned());
+    assert!(provider.create_instance(&spec).await.is_ok());
+
+    let bodies = captured_insert.lock().await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["labels"]["open-ci-expires-at"], json!("2000"));
+    assert_eq!(bodies[0]["labels"]["open-ci-tenant"], json!("tenant_acme"));
+    assert_eq!(
+        bodies[0]["disks"][0]["initializeParams"]["labels"]["open-ci-expires-at"],
+        json!("2000")
+    );
+    assert_eq!(
+        bodies[0]["disks"][0]["initializeParams"]["labels"]["open-ci-tenant"],
+        json!("tenant_acme")
+    );
+
+    let instances = provider
+        .list_managed_instances("us-central1-a", Some("default"), Some("tenant_acme"))
+        .await;
+    assert!(matches!(
+        instances,
+        Ok(ref list) if list.len() == 2 && list[0].id == "1" && list[1].id == "2"
+    ));
+
+    let disks = provider
+        .list_managed_disks("us-central1-a", Some("default"), Some("tenant_acme"))
+        .await;
+    assert!(matches!(
+        disks,
+        Ok(ref list) if list.len() == 2 && list[0].attached && !list[1].attached
+    ));
+
+    let mut bad_spec = instance_spec("open-ci-bad", "req-bad", test_placement(true));
+    bad_spec.tenant_id = Some("BAD TENANT!".to_owned());
+    assert!(matches!(
+        provider.create_instance(&bad_spec).await,
+        Err(ProviderError::InvalidConfig(_))
+    ));
 }

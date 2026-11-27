@@ -44,6 +44,11 @@ pub fn parse_sts_account(xml: &str) -> Option<String> {
     extract_first_tag(xml, "Account")
 }
 
+/// Extracts `<nextToken>...</nextToken>` from paginated EC2 Query responses.
+pub fn parse_next_token(xml: &str) -> Option<String> {
+    extract_first_tag(xml, "nextToken").filter(|token| !token.is_empty())
+}
+
 /// Extracts `<Credentials>` from an STS `AssumeRoleResponse`.
 pub fn parse_assume_role_credentials(xml: &str) -> Option<ParsedStsCredentials> {
     let mut reader = Reader::from_str(xml);

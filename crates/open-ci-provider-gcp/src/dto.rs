@@ -14,6 +14,8 @@ pub(crate) struct GcpInstanceDto {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) status: String,
+    #[serde(default, rename = "creationTimestamp")]
+    pub(crate) creation_timestamp: Option<String>,
     #[serde(default)]
     pub(crate) labels: BTreeMap<String, String>,
 }
@@ -25,6 +27,8 @@ pub(crate) struct GcpDiskDto {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) status: String,
+    #[serde(default, rename = "creationTimestamp")]
+    pub(crate) creation_timestamp: Option<String>,
     #[serde(default)]
     pub(crate) labels: BTreeMap<String, String>,
     #[serde(default)]
@@ -35,6 +39,8 @@ pub(crate) struct GcpDiskDto {
 pub(crate) struct GcpListDto<T> {
     #[serde(default = "Vec::new")]
     pub(crate) items: Vec<T>,
+    #[serde(default, rename = "nextPageToken")]
+    pub(crate) next_page_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -143,6 +149,13 @@ pub(crate) fn build_insert_body(config: &GcpProviderConfig, spec: &InstanceSpec)
     let mut labels = BTreeMap::new();
     labels.insert("open-ci-managed".to_owned(), "true".to_owned());
     labels.insert("open-ci-pool".to_owned(), spec.pool_id.clone());
+    labels.insert(
+        "open-ci-expires-at".to_owned(),
+        spec.expires_at_unix.to_string(),
+    );
+    if let Some(tenant) = spec.tenant_id.as_deref().filter(|t| !t.is_empty()) {
+        labels.insert("open-ci-tenant".to_owned(), tenant.to_owned());
+    }
 
     let provisioning_model = if spec.placement.spot {
         "SPOT"
