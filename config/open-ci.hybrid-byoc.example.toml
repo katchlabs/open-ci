@@ -37,6 +37,7 @@ memory_hugepages = false
 pin_physical_cpus = false
 default_vcpus = 4
 default_memory_mib = 16384
+max_instances = 8
 
 [gcp]
 project = "your-gcp-project-id"

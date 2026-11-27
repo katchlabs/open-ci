@@ -465,6 +465,7 @@ async fn max_instances_cap_returns_capacity_unavailable_for_hybrid_spillover() {
     let mk_spec = |name: &str| InstanceSpec {
         worker_name: name.to_owned(),
         pool_id: "hybrid".to_owned(),
+        tenant_id: None,
         request_id: format!("req-{name}"),
         placement: placement.clone(),
         disk_gb: 64,
