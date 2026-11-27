@@ -21,6 +21,8 @@ pub struct CacheServiceConfig {
     pub max_entry_bytes: u64,
     #[serde(default = "default_signed_url_ttl_seconds")]
     pub signed_url_ttl_seconds: u64,
+    #[serde(default)]
+    pub hot_cache_bytes: u64,
     /// `SQLite` database holding cache entry metadata.
     #[serde(default = "default_index_path")]
     pub index_path: String,
@@ -211,7 +213,12 @@ mod tests {
                 && c.upstream_results_url == DEFAULT_ACTIONS_RESULTS_URL
                 && c.auth.repositories.allows(42)
                 && !c.auth.repositories.allows(43)
+                && c.hot_cache_bytes == 0
         ));
+        let with_hot = parse(
+            "public_url = \"http://10.0.0.5:8090\"\nhot_cache_bytes = 1073741824\n[auth]\nrepositories = [42]\n",
+        );
+        assert!(matches!(with_hot, Ok(c) if c.hot_cache_bytes == 1_073_741_824));
     }
 
     #[test]

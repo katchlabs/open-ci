@@ -34,6 +34,8 @@ pub struct OpenCiConfig {
     #[serde(default)]
     pub aws: Option<AwsProviderConfig>,
     #[serde(default)]
+    pub cloud_hypervisor: Option<CloudHypervisorProviderConfig>,
+    #[serde(default)]
     pub cache: Option<CacheServiceConfig>,
     pub admission: AdmissionConfig,
     pub pools: BTreeMap<String, PoolConfig>,
@@ -132,6 +134,35 @@ pub struct AwsProviderConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CloudHypervisorProviderConfig {
+    #[serde(default = "default_ch_binary")]
+    pub binary: String,
+    #[serde(default = "default_ch_state_dir")]
+    pub state_dir: String,
+    pub kernel_path: String,
+    pub rootfs_image: String,
+    #[serde(default = "default_ch_cmdline")]
+    pub kernel_cmdline: String,
+    #[serde(default = "default_ch_bridge")]
+    pub bridge_name: String,
+    #[serde(default = "default_ch_subnet")]
+    pub subnet_cidr: String,
+    #[serde(default)]
+    pub host_direct_io: bool,
+    #[serde(default = "default_ch_blk_queues")]
+    pub virtio_blk_queues: u32,
+    #[serde(default)]
+    pub memory_hugepages: bool,
+    #[serde(default)]
+    pub pin_physical_cpus: bool,
+    #[serde(default = "default_ch_vcpus")]
+    pub default_vcpus: u32,
+    #[serde(default = "default_ch_memory_mib")]
+    pub default_memory_mib: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdmissionConfig {
     #[serde(default)]
     pub mode: AdmissionMode,
@@ -223,6 +254,20 @@ pub struct Placement {
     pub root_device: Option<String>,
     #[serde(default)]
     pub max_spot_price_usd: Option<String>,
+    #[serde(default)]
+    pub core_count: Option<u32>,
+    #[serde(default)]
+    pub threads_per_core: Option<u32>,
+    #[serde(default)]
+    pub local_ssd_count: Option<u32>,
+    #[serde(default)]
+    pub network_bandwidth_tier: Option<String>,
+    #[serde(default)]
+    pub ebs_iops: Option<u32>,
+    #[serde(default)]
+    pub ebs_throughput_mbps: Option<u32>,
+    #[serde(default)]
+    pub placement_group: Option<String>,
 }
 
 impl Placement {
@@ -234,7 +279,7 @@ impl Placement {
                 .split('.')
                 .next()
                 .unwrap_or(&self.machine_type),
-            ProviderKind::Gcp | ProviderKind::Mock => self
+            ProviderKind::Gcp | ProviderKind::CloudHypervisor | ProviderKind::Mock => self
                 .machine_type
                 .split('-')
                 .next()
@@ -333,6 +378,30 @@ fn default_gcp_compute_url() -> String {
 }
 fn default_network_tier() -> String {
     "PREMIUM".to_owned()
+}
+fn default_ch_binary() -> String {
+    "/usr/local/bin/cloud-hypervisor".to_owned()
+}
+fn default_ch_state_dir() -> String {
+    "/var/lib/open-ci/microvms".to_owned()
+}
+fn default_ch_cmdline() -> String {
+    "console=ttyS0 root=/dev/vda rw init=/sbin/init quiet".to_owned()
+}
+fn default_ch_bridge() -> String {
+    "open-ci-br0".to_owned()
+}
+fn default_ch_subnet() -> String {
+    "10.200.0.0/16".to_owned()
+}
+const fn default_ch_blk_queues() -> u32 {
+    4
+}
+const fn default_ch_vcpus() -> u32 {
+    4
+}
+const fn default_ch_memory_mib() -> u64 {
+    16_384
 }
 const fn default_max_run_seconds() -> u64 {
     3600

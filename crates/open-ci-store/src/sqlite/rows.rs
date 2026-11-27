@@ -25,6 +25,7 @@ pub(super) fn parse_provider(value: &str) -> Result<ProviderKind, StoreError> {
     match value {
         "gcp" => Ok(ProviderKind::Gcp),
         "aws" => Ok(ProviderKind::Aws),
+        "cloud_hypervisor" => Ok(ProviderKind::CloudHypervisor),
         "mock" => Ok(ProviderKind::Mock),
         other => Err(StoreError::CorruptData(format!(
             "unknown provider `{other}`"

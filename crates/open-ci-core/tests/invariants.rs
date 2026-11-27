@@ -35,6 +35,13 @@ fn mock_placement(region: &str, zone: &str, machine_type: &str, subnet: &str) ->
         security_group: None,
         root_device: None,
         max_spot_price_usd: None,
+        core_count: None,
+        threads_per_core: None,
+        local_ssd_count: None,
+        network_bandwidth_tier: None,
+        ebs_iops: None,
+        ebs_throughput_mbps: None,
+        placement_group: None,
     }
 }
 
@@ -102,6 +109,7 @@ fn sample_config(max_vcpu: u32, max_instances: u32, max_disk: u32) -> OpenCiConf
         },
         gcp: None,
         aws: None,
+        cloud_hypervisor: None,
         cache: None,
         admission: AdmissionConfig {
             mode: AdmissionMode::Oidc,

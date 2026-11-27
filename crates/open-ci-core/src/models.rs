@@ -11,6 +11,8 @@ use std::fmt;
 pub enum ProviderKind {
     Gcp,
     Aws,
+    #[serde(rename = "cloud_hypervisor")]
+    CloudHypervisor,
     Mock,
 }
 
@@ -19,6 +21,7 @@ impl ProviderKind {
         match self {
             Self::Gcp => "gcp",
             Self::Aws => "aws",
+            Self::CloudHypervisor => "cloud_hypervisor",
             Self::Mock => "mock",
         }
     }

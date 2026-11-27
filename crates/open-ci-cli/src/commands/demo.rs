@@ -7,45 +7,53 @@ use open_ci_core::config::{
 use open_ci_core::{AdmissionMode, Architecture, Capacity, ProviderKind};
 use std::collections::{BTreeMap, BTreeSet};
 
+fn demo_pool() -> PoolConfig {
+    PoolConfig {
+        runner_label: "open-ci-default".to_owned(),
+        fallback_label: "ubuntu-latest".to_owned(),
+        architecture: Architecture::X64,
+        vcpu: 2,
+        disk_gb: 30,
+        max_instances: 4,
+        max_instances_per_run: None,
+        min_idle_instances: 0,
+        max_total_instances: None,
+        creates_per_tick: 2,
+        lifetime_seconds: 1800,
+        idle_seconds: 120,
+        job_poll_seconds: 15,
+        cloud_discovery_seconds: 60,
+        prefer_cheapest: true,
+        provider_weights: BTreeMap::new(),
+        transparent_cache: false,
+        placements: vec![Placement {
+            provider: ProviderKind::Mock,
+            region: "local-1".to_owned(),
+            zone: "local-1a".to_owned(),
+            machine_type: "mock-standard-2".to_owned(),
+            subnet: "mock-subnet".to_owned(),
+            spot: true,
+            disk_type: None,
+            disk_interface: None,
+            nic_type: None,
+            image: None,
+            security_group: None,
+            root_device: None,
+            max_spot_price_usd: None,
+            core_count: None,
+            threads_per_core: None,
+            local_ssd_count: None,
+            network_bandwidth_tier: None,
+            ebs_iops: None,
+            ebs_throughput_mbps: None,
+            placement_group: None,
+        }],
+    }
+}
+
 pub fn build_demo_config(listen: &str) -> OpenCiConfig {
     let mut pools = BTreeMap::new();
-    pools.insert(
-        "default".to_owned(),
-        PoolConfig {
-            runner_label: "open-ci-default".to_owned(),
-            fallback_label: "ubuntu-latest".to_owned(),
-            architecture: Architecture::X64,
-            vcpu: 2,
-            disk_gb: 30,
-            max_instances: 4,
-            max_instances_per_run: None,
-            min_idle_instances: 0,
-            max_total_instances: None,
-            creates_per_tick: 2,
-            lifetime_seconds: 1800,
-            idle_seconds: 120,
-            job_poll_seconds: 15,
-            cloud_discovery_seconds: 60,
-            prefer_cheapest: true,
-            provider_weights: BTreeMap::new(),
-            transparent_cache: false,
-            placements: vec![Placement {
-                provider: ProviderKind::Mock,
-                region: "local-1".to_owned(),
-                zone: "local-1a".to_owned(),
-                machine_type: "mock-standard-2".to_owned(),
-                subnet: "mock-subnet".to_owned(),
-                spot: true,
-                disk_type: None,
-                disk_interface: None,
-                nic_type: None,
-                image: None,
-                security_group: None,
-                root_device: None,
-                max_spot_price_usd: None,
-            }],
-        },
-    );
+    pools.insert("default".to_owned(), demo_pool());
     let mut workflows = BTreeMap::new();
     workflows.insert(
         "example/repo/.github/workflows/ci.yml@1111111111111111111111111111111111111111".to_owned(),
@@ -83,6 +91,7 @@ pub fn build_demo_config(listen: &str) -> OpenCiConfig {
         },
         gcp: None,
         aws: None,
+        cloud_hypervisor: None,
         cache: None,
         admission: AdmissionConfig {
             mode: AdmissionMode::Hybrid,

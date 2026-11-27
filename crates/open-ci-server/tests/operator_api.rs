@@ -56,6 +56,13 @@ fn operator_test_config() -> OpenCiConfig {
                 security_group: None,
                 root_device: None,
                 max_spot_price_usd: None,
+                core_count: None,
+                threads_per_core: None,
+                local_ssd_count: None,
+                network_bandwidth_tier: None,
+                ebs_iops: None,
+                ebs_throughput_mbps: None,
+                placement_group: None,
             }],
         },
     );
@@ -93,6 +100,7 @@ fn operator_test_config() -> OpenCiConfig {
         },
         gcp: None,
         aws: None,
+        cloud_hypervisor: None,
         cache: None,
         admission: AdmissionConfig {
             mode: AdmissionMode::Oidc,

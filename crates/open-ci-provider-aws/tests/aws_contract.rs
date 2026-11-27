@@ -14,6 +14,7 @@ use reqwest::Client;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
 fn test_placement(spot: bool) -> Placement {
     Placement {
@@ -30,6 +31,13 @@ fn test_placement(spot: bool) -> Placement {
         security_group: Some("sg-0123456789abcdef0".to_owned()),
         root_device: Some("/dev/sda1".to_owned()),
         max_spot_price_usd: spot.then(|| "0.04".to_owned()),
+        core_count: None,
+        threads_per_core: None,
+        local_ssd_count: None,
+        network_bandwidth_tier: None,
+        ebs_iops: None,
+        ebs_throughput_mbps: None,
+        placement_group: None,
     }
 }
 
@@ -182,5 +190,69 @@ async fn spot_price_and_unsupported_map_to_capacity_unavailable_and_missing_spot
             .create_instance(&instance_spec(worker, test_placement(true)))
             .await;
         assert_eq!(result, Err(expected), "{worker}");
+    }
+}
+
+#[tokio::test]
+async fn run_instances_wires_cpu_options_ebs_tuning_and_placement_group() {
+    let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture_clone = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/",
+        post(move |body: String| {
+            let capture_clone = Arc::clone(&capture_clone);
+            async move {
+                capture_clone.lock().await.push(body);
+                (
+                    StatusCode::OK,
+                    "<RunInstancesResponse><instancesSet><item><instanceId>i-0hw1234567890abcd</instanceId><instanceState><name>pending</name></instanceState><placement><availabilityZone>us-east-1a</availabilityZone></placement></item></instancesSet></RunInstancesResponse>".to_owned(),
+                )
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.ok();
+    assert!(listener.is_some());
+    let Some(listener) = listener else { return };
+    let addr = listener.local_addr().ok();
+    assert!(addr.is_some());
+    let Some(addr) = addr else { return };
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let provider = test_provider(addr);
+    let default_receipt = provider
+        .create_instance(&instance_spec("default-hw-worker", test_placement(true)))
+        .await;
+    assert!(default_receipt.is_ok());
+
+    let mut tuned = test_placement(true);
+    tuned.core_count = Some(8);
+    tuned.threads_per_core = Some(1);
+    tuned.ebs_iops = Some(16_000);
+    tuned.ebs_throughput_mbps = Some(1_000);
+    tuned.placement_group = Some("ci-cluster-pg".to_owned());
+
+    let tuned_receipt = provider
+        .create_instance(&instance_spec("tuned-hw-worker", tuned))
+        .await;
+    assert!(tuned_receipt.is_ok());
+
+    let bodies = captured.lock().await;
+    assert_eq!(bodies.len(), 2);
+    if let [default_body, tuned_body] = bodies.as_slice() {
+        assert!(!default_body.contains("CpuOptions.CoreCount="));
+        assert!(!default_body.contains("CpuOptions.ThreadsPerCore="));
+        assert!(!default_body.contains("BlockDeviceMapping.1.Ebs.Iops="));
+        assert!(!default_body.contains("BlockDeviceMapping.1.Ebs.Throughput="));
+        assert!(!default_body.contains("Placement.GroupName="));
+
+        assert!(tuned_body.contains("MetadataOptions.HttpTokens=required"));
+        assert!(tuned_body.contains("CpuOptions.CoreCount=8"));
+        assert!(tuned_body.contains("CpuOptions.ThreadsPerCore=1"));
+        assert!(tuned_body.contains("BlockDeviceMapping.1.Ebs.Iops=16000"));
+        assert!(tuned_body.contains("BlockDeviceMapping.1.Ebs.Throughput=1000"));
+        assert!(tuned_body.contains("Placement.GroupName=ci-cluster-pg"));
     }
 }
