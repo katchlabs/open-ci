@@ -12,6 +12,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
 fn test_placement(spot: bool) -> Placement {
     Placement {
@@ -28,6 +29,13 @@ fn test_placement(spot: bool) -> Placement {
         security_group: None,
         root_device: None,
         max_spot_price_usd: None,
+        core_count: None,
+        threads_per_core: None,
+        local_ssd_count: None,
+        network_bandwidth_tier: None,
+        ebs_iops: None,
+        ebs_throughput_mbps: None,
+        placement_group: None,
     }
 }
 
@@ -147,5 +155,110 @@ async fn gcp_adapter_supports_spot_and_ondemand_and_detects_quota_errors() {
                 );
             }
         }
+    }
+}
+
+fn instance_spec(worker_name: &str, request_id: &str, placement: Placement) -> InstanceSpec {
+    InstanceSpec {
+        worker_name: worker_name.to_owned(),
+        pool_id: "default".to_owned(),
+        request_id: request_id.to_owned(),
+        placement,
+        disk_gb: 40,
+        lifetime_seconds: 1800,
+        expires_at_unix: 2000,
+        user_data: "#!/bin/sh\n".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn gcp_insert_wires_threads_per_core_local_ssds_and_network_bandwidth_tier() {
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let capture_clone = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/projects/demo/zones/us-central1-a/instances",
+        post(move |Json(body): Json<Value>| {
+            let capture_clone = Arc::clone(&capture_clone);
+            async move {
+                capture_clone.lock().await.push(body);
+                Json(json!({ "name": "op-hw", "status": "RUNNING" }))
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.ok();
+    assert!(listener.is_some());
+    let Some(listener) = listener else { return };
+    let addr = listener.local_addr().ok();
+    assert!(addr.is_some());
+    let Some(addr) = addr else { return };
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let provider = GcpProvider::new(
+        GcpProviderConfig {
+            project: "demo".to_owned(),
+            compute_url: format!("http://{addr}"),
+            image: "projects/demo/global/images/runner-v1".to_owned(),
+            external_ipv4: false,
+            network_tier: "PREMIUM".to_owned(),
+            network_tags: vec!["open-ci-worker".to_owned()],
+            impersonate_service_account: None,
+        },
+        Client::new(),
+        Arc::new(StaticTokenSource(SecretString::new("tok"))),
+    );
+
+    assert!(
+        provider
+            .create_instance(&instance_spec(
+                "open-ci-default-hw",
+                "req-hw-1",
+                test_placement(true)
+            ))
+            .await
+            .is_ok()
+    );
+
+    let mut tuned = test_placement(true);
+    tuned.threads_per_core = Some(1);
+    tuned.local_ssd_count = Some(2);
+    tuned.network_bandwidth_tier = Some("TIER_1".to_owned());
+
+    assert!(
+        provider
+            .create_instance(&instance_spec("open-ci-tuned-hw", "req-hw-2", tuned))
+            .await
+            .is_ok()
+    );
+
+    let bodies = captured.lock().await;
+    assert_eq!(bodies.len(), 2);
+    if let [default_body, tuned_body] = bodies.as_slice() {
+        assert_eq!(default_body["disks"].as_array().map(Vec::len), Some(1));
+        assert!(default_body.get("advancedMachineFeatures").is_none());
+        assert!(default_body.get("networkPerformanceConfig").is_none());
+
+        assert_eq!(tuned_body["serviceAccounts"], json!([]));
+        assert_eq!(
+            tuned_body["advancedMachineFeatures"],
+            json!({ "threadsPerCore": 1 })
+        );
+        assert_eq!(
+            tuned_body["networkPerformanceConfig"],
+            json!({ "totalEgressBandwidthTier": "TIER_1" })
+        );
+        assert_eq!(tuned_body["disks"].as_array().map(Vec::len), Some(3));
+        let expected_ssd = json!({
+            "type": "SCRATCH",
+            "autoDelete": true,
+            "interface": "NVME",
+            "initializeParams": {
+                "diskType": "zones/us-central1-a/diskTypes/local-ssd"
+            }
+        });
+        assert_eq!(tuned_body["disks"][1], expected_ssd);
+        assert_eq!(tuned_body["disks"][2], expected_ssd);
     }
 }

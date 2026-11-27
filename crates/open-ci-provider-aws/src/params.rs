@@ -114,6 +114,20 @@ pub(crate) fn build_run_instances_params(
         ("MetadataOptions.HttpPutResponseHopLimit", "1".to_owned()),
     ];
 
+    if let (Some(cores), Some(tpc)) = (spec.placement.core_count, spec.placement.threads_per_core) {
+        params.push(("CpuOptions.CoreCount", cores.to_string()));
+        params.push(("CpuOptions.ThreadsPerCore", tpc.to_string()));
+    }
+    if let Some(iops) = spec.placement.ebs_iops {
+        params.push(("BlockDeviceMapping.1.Ebs.Iops", iops.to_string()));
+    }
+    if let Some(mbps) = spec.placement.ebs_throughput_mbps {
+        params.push(("BlockDeviceMapping.1.Ebs.Throughput", mbps.to_string()));
+    }
+    if let Some(group) = &spec.placement.placement_group {
+        params.push(("Placement.GroupName", group.clone()));
+    }
+
     if spec.placement.spot {
         params.push(("InstanceMarketOptions.MarketType", "spot".to_owned()));
         params.push((

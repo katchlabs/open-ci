@@ -72,6 +72,41 @@ pub(crate) struct GcpQuotaInfo {
     pub(crate) dimensions: BTreeMap<String, String>,
 }
 
+fn build_disks(
+    spec: &InstanceSpec,
+    disk_type: &str,
+    disk_interface: &str,
+    image: &str,
+    labels: &BTreeMap<String, String>,
+) -> Vec<Value> {
+    let mut disks = vec![json!({
+        "boot": true,
+        "autoDelete": true,
+        "interface": disk_interface,
+        "initializeParams": {
+            "diskName": spec.worker_name,
+            "sourceImage": image,
+            "diskSizeGb": spec.disk_gb.to_string(),
+            "diskType": format!("zones/{}/diskTypes/{disk_type}", spec.placement.zone),
+            "labels": labels,
+        }
+    })];
+    if let Some(count) = spec.placement.local_ssd_count {
+        let ssd_disk_type = format!("zones/{}/diskTypes/local-ssd", spec.placement.zone);
+        for _ in 0..count {
+            disks.push(json!({
+                "type": "SCRATCH",
+                "autoDelete": true,
+                "interface": "NVME",
+                "initializeParams": {
+                    "diskType": ssd_disk_type,
+                }
+            }));
+        }
+    }
+    disks
+}
+
 pub(crate) fn build_insert_body(config: &GcpProviderConfig, spec: &InstanceSpec) -> Value {
     let family = spec.placement.machine_family();
     let modern_platform = matches!(
@@ -115,22 +150,13 @@ pub(crate) fn build_insert_body(config: &GcpProviderConfig, spec: &InstanceSpec)
         "STANDARD"
     };
 
+    let disks = build_disks(spec, disk_type, disk_interface, image, &labels);
+
     let mut body = json!({
         "name": spec.worker_name,
         "machineType": format!("zones/{}/machineTypes/{}", spec.placement.zone, spec.placement.machine_type),
         "labels": labels,
-        "disks": [{
-            "boot": true,
-            "autoDelete": true,
-            "interface": disk_interface,
-            "initializeParams": {
-                "diskName": spec.worker_name,
-                "sourceImage": image,
-                "diskSizeGb": spec.disk_gb.to_string(),
-                "diskType": format!("zones/{}/diskTypes/{disk_type}", spec.placement.zone),
-                "labels": labels,
-            }
-        }],
+        "disks": disks,
         "networkInterfaces": [net],
         "serviceAccounts": [],
         "shieldedInstanceConfig": {
@@ -159,6 +185,12 @@ pub(crate) fn build_insert_body(config: &GcpProviderConfig, spec: &InstanceSpec)
         }
     });
 
+    if let Some(tpc) = spec.placement.threads_per_core {
+        body["advancedMachineFeatures"] = json!({ "threadsPerCore": tpc });
+    }
+    if let Some(tier) = &spec.placement.network_bandwidth_tier {
+        body["networkPerformanceConfig"] = json!({ "totalEgressBandwidthTier": tier });
+    }
     if !config.network_tags.is_empty() {
         body["tags"] = json!({ "items": config.network_tags });
     }
