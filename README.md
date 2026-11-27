@@ -45,7 +45,7 @@
 ## Why `open-ci`?
 
 - **85–90% lower compute spend, zero SaaS tax.** Pay raw AWS and GCP Spot (or On-Demand) rates, burn existing cloud credits, and run the entire control plane on a single `~$12–$15/mo` VM (`t4g.small` or `e2-small`). Zero per-seat fees, zero cache markup.
-- **Faster builds out of the box.** Ships with a native **GitHub Actions Cache v2** server (`open-ci cache`, verified against the official `@actions/cache` client) backed by local NVMe, S3/R2/MinIO, or native GCS with keyless VM credentials — plus boot-time auto-NVMe `ext4`/RAID0 mounting for Docker layers, `RUNNER_WORKDIR`, and `TMPDIR`.
+- **Faster builds out of the box.** Ships with a native **GitHub Actions Cache v2** server (`open-ci cache`, verified against the official `@actions/cache` client) backed by local NVMe, S3/R2/MinIO, or native GCS with keyless VM credentials and an optional bounded RAM hot tier (`hot_cache_bytes`) — plus boot-time auto-NVMe `ext4`/RAID0 mounting for Docker layers, `RUNNER_WORKDIR`, and `TMPDIR`.
 - **Drop-in or fail-closed routing.** Change a single line (`runs-on: open-ci-linux-x64`) with `admission.mode = "webhook"`, or route via [`katchlabs/open-ci/actions/route@v0.1.1`](actions/route) in `oidc` / `hybrid` mode so controller downtime, drains, reruns, or capacity limits fall back cleanly to `ubuntu-latest` without breaking CI.
 - **Multi-cloud without Kubernetes or CLI bloat.** Pure-Rust AWS EC2 + STS SigV4/XML and GCP Compute Engine REST adapters spill automatically across regions, families, and clouds on Spot stockout. Native keyless cloud identity (`IMDSv2`, STS `AssumeRole` + `ExternalId`, GCE metadata, IAM SA impersonation, and keyless GCP→AWS web identity federation) plus org-wide multi-repo pools.
 - **Zero-IAM, hard-bounded workers.** Every ephemeral runner boots with zero cloud IAM (`serviceAccounts: []` on GCP; no instance profile + IMDSv2 enforced on AWS), zero inbound ports, single-use atomic HMAC bootstrap tokens, and triple-layer hard expiry (`reconciler` + `maxRunDuration`/`open-ci-aws-janitor` + guest `poweroff`).
@@ -265,6 +265,7 @@ We prefer clear engineering boundaries over marketing claims:
 | ✓ | Auto-NVMe RAID0/ext4 & BuildKit tuning | `x64` & `arm64` Ubuntu 24.04 Packer templates |
 | ✓ | Keyless BYOC cloud identity | `IMDSv2`, STS `AssumeRole` + `ExternalId`, GCE metadata, SA impersonation, GCP→AWS federation |
 | ✓ | Turnkey Terraform & multi-arch releases | `aws-controller`, `gcp-controller`, GHCR + `.tar.gz` + Lambda zips |
+| ✓ | Bare-metal / nested-KVM microVMs | Pure-Rust `open-ci-provider-ch` (Cloud Hypervisor + XFS reflink CoW rootfs) |
 | ○ | `PostgresStore` for active-active HA | Same async `Store` trait; zero domain changes |
 | ○ | Operator Web UI | Backed by existing `/api/v1/*` REST + `/api/v1/events` SSE |
 | ○ | Additional cloud providers | Hetzner, Azure, Kubernetes via `CloudProvider` trait |
@@ -273,24 +274,26 @@ We prefer clear engineering boundaries over marketing claims:
 ---
 
 <details>
-<summary><strong>Workspace &amp; Infrastructure Map (11 Rust Crates + IaC)</strong></summary>
+<summary><strong>Workspace &amp; Infrastructure Map (12 Rust Crates + IaC)</strong></summary>
 
 | Path | Responsibility |
 | --- | --- |
 | `crates/open-ci-core` | Zero-I/O domain core: typed TOML config + validation, worker state machine, admission capacity math, placement selection, regional quota backoff, `SecretString`, `Clock`. |
 | `crates/open-ci-store` | Async `Store` trait and non-blocking normalized `SQLite` backend (`spawn_blocking`, WAL, `0o600` pre-creation, `fs2` exclusive lockfile, online backup snapshots). |
 | `crates/open-ci-provider` | Cloud-agnostic `CloudProvider` trait, typed `ProviderError`, `InstanceSpec`, and `ProviderRegistry`. |
-| `crates/open-ci-provider-aws` | Pure-Rust AWS EC2 + STS adapter (SigV4 signing, XML parsing, Spot/On-Demand, IMDSv2, cross-account `AssumeRole` with `ExternalId`, GCP→AWS web identity). |
-| `crates/open-ci-provider-gcp` | Native Rust GCP Compute Engine REST adapter (Spot/On-Demand, `maxRunDuration`, `serviceAccounts: []`, GCE metadata & IAM impersonation). |
+| `crates/open-ci-provider-aws` | Pure-Rust AWS EC2 + STS adapter (SigV4 signing, XML parsing, Spot/On-Demand, hardware placement tuning, IMDSv2, cross-account `AssumeRole` with `ExternalId`, GCP→AWS web identity). |
+| `crates/open-ci-provider-gcp` | Native Rust GCP Compute Engine REST adapter (Spot/On-Demand, Hyperdisk/Local SSD/gVNIC/Tier-1 tuning, `maxRunDuration`, `serviceAccounts: []`, GCE metadata & IAM impersonation). |
+| `crates/open-ci-provider-ch` | Pure-Rust Cloud Hypervisor microVM provider over Unix socket REST API with XFS reflink CoW rootfs clones, per-VM `/dev/vdb` seed injection, and optional physical-core pinning. |
 | `crates/open-ci-provider-mock` | Deterministic fault-injecting provider for tests and `open-ci demo`. |
 | `crates/open-ci-github` | Typed GitHub REST client (bounded pagination, repo & org JIT registration), constant-time HMAC webhook verifier, RS256 OIDC JWT verifier, privilege-separated credential broker. |
-| `crates/open-ci-server` | Non-blocking `ControlPlane`, background reconciler, public machine ingress, authenticated Operator API, SSE stream, and Prometheus `/metrics`. |
-| `crates/open-ci-cache` | Native GitHub Actions v2 transparent cache server (Twirp RPCs + Azure block blob protocol): runtime-token auth with ref-scoped entries, `SQLite` index with retention, streaming `local`/`s3`/`gcs` blob stores, and results-service passthrough. |
+| `crates/open-ci-server` | Non-blocking `ControlPlane`, event-driven + periodic reconciler, public machine ingress, authenticated Operator API, SSE stream, and Prometheus `/metrics`. |
+| `crates/open-ci-cache` | Native GitHub Actions v2 transparent cache server (Twirp RPCs + Azure block blob protocol): runtime-token auth with ref-scoped entries, `SQLite` index with retention, bounded RAM hot tier (`HotMemoryBlobStore`), zero-copy local block manifests, streaming `local`/`s3`/`gcs` blob stores, and results-service passthrough. |
 | `crates/open-ci-aws-janitor` | Standalone Rust CLI and AWS Lambda (`provided.al2023`) expiry guard that terminates leaked EC2 instances and detached EBS volumes with per-resource fault isolation. |
 | `crates/open-ci-cli` | Unified CLI binary (`serve`, `cache`, `demo`, `validate`, `ctl`, `backup`, `rotate-credentials`, `agent bootstrap`). |
 | `actions/route` | Zero-dependency TypeScript (`node24`) GitHub Action for fail-closed OIDC admission routing. |
 | `infra/terraform` | Turnkey modules (`gcp-foundation`, `gcp-controller`, `aws-foundation`, `aws-controller`) and examples (`gcp-quickstart`, `aws-controller`, `multi-cloud`). |
 | `infra/packer` | Unified GCP + AWS Packer template (`ubuntu-runner.pkr.hcl`) for `x64`/`arm64` Ubuntu 24.04 runners with boot-time auto-NVMe (`setup-nvme.sh`), Docker BuildKit, and sysctl tuning. |
+| `infra/cloud-hypervisor` | Bare-metal / nested-KVM Ubuntu 24.04 host setup (`setup-host.sh`) and sparse ext4 rootfs + kernel builder (`build-rootfs.sh`). |
 | `deploy/` | Hardened systemd units (`open-ci.service`, `open-ci-cache.service`, `open-ci-credentials.timer`, `open-ci-backup.timer`), Caddy reverse proxy template, and multi-stage Dockerfile. |
 
 </details>
