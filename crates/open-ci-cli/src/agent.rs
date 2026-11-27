@@ -66,6 +66,10 @@ async fn execute_runner_lifecycle(
     let cache_url = configured_cache_url(env, fallback_cache_url.as_deref())
         .filter(|_| redirect_runner_to_cache(runner_dir));
 
+    if is_running_as_root() && std::env::var_os("OPEN_CI_AGENT_SKIP_IMDS_BLOCK").is_none() {
+        block_runner_imds_access(&runner_user()).await;
+    }
+
     let mut cmd = build_runner_command(
         &run_script,
         runner_dir,
@@ -142,6 +146,102 @@ async fn fetch_jit_config(client: &Client, env: &AgentEnvelope) -> Result<String
     ))
 }
 
+fn runner_user() -> String {
+    std::env::var("OPEN_CI_RUNNER_USER").unwrap_or_else(|_| "runner".to_owned())
+}
+
+fn imds_block_iptables_rule_args(user: &str) -> Vec<String> {
+    vec![
+        "-d".to_owned(),
+        "169.254.169.254/32".to_owned(),
+        "-m".to_owned(),
+        "owner".to_owned(),
+        "--uid-owner".to_owned(),
+        user.to_owned(),
+        "-j".to_owned(),
+        "REJECT".to_owned(),
+    ]
+}
+
+fn resolve_uid_from_passwd(passwd: &str, user: &str) -> Option<u32> {
+    if let Ok(uid) = user.parse::<u32>() {
+        return Some(uid);
+    }
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _pw = fields.next()?;
+        let uid = fields.next()?;
+        (name == user).then(|| uid.parse::<u32>().ok()).flatten()
+    })
+}
+
+fn imds_block_nft_script(uid: u32) -> String {
+    format!(
+        "add table inet open_ci_imds\n\
+         add chain inet open_ci_imds output {{ type filter hook output priority 0; policy accept; }}\n\
+         add rule inet open_ci_imds output ip daddr 169.254.169.254 meta skuid {uid} reject\n"
+    )
+}
+
+async fn block_runner_imds_access(user: &str) {
+    let rule = imds_block_iptables_rule_args(user);
+    let check = Command::new("iptables")
+        .arg("-C")
+        .arg("OUTPUT")
+        .args(&rule)
+        .status()
+        .await;
+    if check.is_ok_and(|s| s.success()) {
+        return;
+    }
+
+    let inserted = Command::new("iptables")
+        .arg("-I")
+        .arg("OUTPUT")
+        .arg("1")
+        .args(&rule)
+        .status()
+        .await;
+    if inserted.is_ok_and(|s| s.success()) {
+        tracing::info!(
+            runner_user = user,
+            "blocked runner UID from IMDS 169.254.169.254 via iptables"
+        );
+        return;
+    }
+
+    if let Ok(passwd) = std::fs::read_to_string("/etc/passwd")
+        && let Some(uid) = resolve_uid_from_passwd(&passwd, user)
+    {
+        let script = imds_block_nft_script(uid);
+        let child = Command::new("nft")
+            .arg("-f")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .spawn();
+        if let Ok(mut proc) = child {
+            if let Some(mut stdin) = proc.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(script.as_bytes()).await;
+            }
+            if proc.wait().await.is_ok_and(|s| s.success()) {
+                tracing::info!(
+                    runner_user = user,
+                    uid,
+                    "blocked runner UID from IMDS 169.254.169.254 via nftables"
+                );
+                return;
+            }
+        }
+    }
+
+    tracing::warn!(
+        runner_user = user,
+        "could not install iptables/nftables IMDS block; relying on cloud zero-IAM and IMDSv2"
+    );
+}
+
 fn build_runner_command(
     run_script: &Path,
     runner_dir: &Path,
@@ -152,11 +252,9 @@ fn build_runner_command(
         resolve_runner_env(cache_url, Path::new(NVME_WORK_DIR), Path::new(NVME_TMP_DIR));
 
     let mut cmd = if is_running_as_root() {
-        let runner_user =
-            std::env::var("OPEN_CI_RUNNER_USER").unwrap_or_else(|_| "runner".to_owned());
         let mut c = Command::new("runuser");
         c.arg("-u")
-            .arg(runner_user)
+            .arg(runner_user())
             .arg("--")
             .arg(run_script)
             .arg("--jitconfig")
@@ -407,5 +505,32 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
+    }
+
+    #[test]
+    fn imds_block_rule_targets_metadata_ip_and_resolves_runner_uid() {
+        let args = imds_block_iptables_rule_args("runner");
+        assert_eq!(
+            args,
+            vec![
+                "-d",
+                "169.254.169.254/32",
+                "-m",
+                "owner",
+                "--uid-owner",
+                "runner",
+                "-j",
+                "REJECT"
+            ]
+        );
+
+        let passwd =
+            "root:x:0:0:root:/root:/bin/bash\nrunner:x:1001:1001::/home/runner:/bin/bash\n";
+        assert_eq!(resolve_uid_from_passwd(passwd, "runner"), Some(1001));
+        assert_eq!(resolve_uid_from_passwd(passwd, "2002"), Some(2002));
+        assert_eq!(resolve_uid_from_passwd(passwd, "missing"), None);
+
+        let nft = imds_block_nft_script(1001);
+        assert!(nft.contains("ip daddr 169.254.169.254 meta skuid 1001 reject"));
     }
 }
