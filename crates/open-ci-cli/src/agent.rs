@@ -13,8 +13,9 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::process::Command;
 
-const BOOTSTRAP_MAX_ATTEMPTS: usize = 8;
-const BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_secs(2);
+const BOOTSTRAP_MAX_ATTEMPTS: usize = 16;
+const BOOTSTRAP_INITIAL_DELAY_MS: u64 = 250;
+const BOOTSTRAP_MAX_DELAY_MS: u64 = 2_000;
 const NVME_WORK_DIR: &str = "/mnt/nvme/work";
 const NVME_TMP_DIR: &str = "/mnt/nvme/tmp";
 
@@ -99,6 +100,11 @@ async fn fetch_jit_config(client: &Client, env: &AgentEnvelope) -> Result<String
     );
 
     for attempt in 1..=BOOTSTRAP_MAX_ATTEMPTS {
+        let retry_delay = Duration::from_millis(
+            BOOTSTRAP_INITIAL_DELAY_MS
+                .saturating_mul(1_u64 << attempt.saturating_sub(1).min(4))
+                .min(BOOTSTRAP_MAX_DELAY_MS),
+        );
         let resp = client
             .post(&boot_url)
             .bearer_auth(&env.bootstrap_token)
@@ -114,7 +120,7 @@ async fn fetch_jit_config(client: &Client, env: &AgentEnvelope) -> Result<String
                 if attempt < BOOTSTRAP_MAX_ATTEMPTS
                     && (r.status() == StatusCode::CONFLICT || r.status().is_server_error()) =>
             {
-                tokio::time::sleep(BOOTSTRAP_RETRY_DELAY).await;
+                tokio::time::sleep(retry_delay).await;
             }
             Ok(r) => {
                 return Err(anyhow!(
@@ -123,7 +129,7 @@ async fn fetch_jit_config(client: &Client, env: &AgentEnvelope) -> Result<String
                 ));
             }
             Err(_) if attempt < BOOTSTRAP_MAX_ATTEMPTS => {
-                tokio::time::sleep(BOOTSTRAP_RETRY_DELAY).await;
+                tokio::time::sleep(retry_delay).await;
             }
             Err(err) => {
                 return Err(err).context("bootstrap request failed");
@@ -205,6 +211,7 @@ fn resolve_runner_env(
     if let Some(cache_url) = cache_url {
         vars.push(("ACTIONS_CACHE_SERVICE_V2", "true".to_owned()));
         vars.push(("ACTIONS_RESULTS_URL", cache_url.to_owned()));
+        vars.push(("ZSTD_CLEVEL", "1".to_owned()));
     }
 
     if is_writable_dir(nvme_work_dir) {
@@ -213,7 +220,9 @@ fn resolve_runner_env(
             nvme_work_dir.to_string_lossy().into_owned(),
         ));
         if is_writable_dir(nvme_tmp_dir) {
-            vars.push(("TMPDIR", nvme_tmp_dir.to_string_lossy().into_owned()));
+            let tmp = nvme_tmp_dir.to_string_lossy().into_owned();
+            vars.push(("TMPDIR", tmp.clone()));
+            vars.push(("RUNNER_TEMP", tmp));
         }
     }
 
@@ -352,8 +361,10 @@ mod tests {
             without.get("COMPOSE_DOCKER_CLI_BUILD").map(String::as_str),
             Some("1")
         );
+        assert!(!without.contains_key("ZSTD_CLEVEL"));
         assert!(!without.contains_key("ACTIONS_RESULTS_URL"));
         assert!(!without.contains_key("RUNNER_WORKDIR"));
+        assert!(!without.contains_key("RUNNER_TEMP"));
 
         let with: HashMap<_, _> =
             resolve_runner_env(Some("http://10.0.0.9:8090/"), missing, missing_tmp)
@@ -388,6 +399,11 @@ mod tests {
             vars.get("TMPDIR").map(String::as_str),
             Some(tmp.to_string_lossy().as_ref())
         );
+        assert_eq!(
+            vars.get("RUNNER_TEMP").map(String::as_str),
+            Some(tmp.to_string_lossy().as_ref())
+        );
+        assert!(!vars.contains_key("ZSTD_CLEVEL"));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())

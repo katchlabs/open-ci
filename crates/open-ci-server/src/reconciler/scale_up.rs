@@ -3,6 +3,7 @@
 use super::ReconcileSummary;
 use crate::bootstrap::render_user_data;
 use crate::{ControlPlane, ServerError};
+use futures_util::stream::{self, StreamExt};
 use open_ci_core::config::{Placement, PoolConfig};
 use open_ci_core::reconcile::{
     RetireReason, demand_summary, plan_scale_up, select_placement, transition_phase,
@@ -15,14 +16,22 @@ use uuid::Uuid;
 
 const QUOTA_BACKOFF_SECONDS: u64 = 300;
 const CAPACITY_BACKOFF_SECONDS: u64 = 90;
+const MAX_CONCURRENT_LAUNCHES: usize = 8;
 
-struct LaunchRequest<'a> {
-    pool_id: &'a str,
-    pool: &'a PoolConfig,
-    placement_idx: usize,
-    placement: &'a Placement,
-    admission_id: Option<String>,
+struct PlannedLaunch {
+    pool_id: String,
+    disk_gb: u32,
+    lifetime_seconds: u64,
+    cache_url: Option<String>,
+    placement: Placement,
+    worker: Worker,
     now: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LaunchOutcome {
+    Created,
+    Retired,
 }
 
 impl ControlPlane {
@@ -55,6 +64,7 @@ impl ControlPlane {
         let backoffs = self.store.list_active_backoffs(now).await?;
         let mut cursor = self.store.get_routing_cursor(pool_id).await?;
         let mut assigned_by_admission = count_unassigned_by_admission(&current_workers);
+        let mut planned = Vec::with_capacity(to_create);
 
         for _ in 0..to_create {
             let Some(placement_idx) = select_placement(pool, &backoffs, &mut cursor, now) else {
@@ -68,78 +78,91 @@ impl ControlPlane {
             if let Some(ref adm) = admission_id {
                 *assigned_by_admission.entry(adm.clone()).or_insert(0) += 1;
             }
-            let req = LaunchRequest {
-                pool_id,
-                pool,
-                placement_idx,
-                placement,
+
+            let short_id = &Uuid::new_v4().simple().to_string()[..12];
+            let worker = Worker {
+                name: format!("open-ci-{pool_id}-{short_id}"),
+                pool_id: pool_id.to_owned(),
                 admission_id,
-                now,
+                request_id: Uuid::new_v4().to_string(),
+                provider: placement.provider,
+                placement_index: placement_idx,
+                region: placement.region.clone(),
+                zone: placement.zone.clone(),
+                machine_type: placement.machine_type.clone(),
+                provider_instance_id: None,
+                phase: WorkerPhase::Planned,
+                create_operation: None,
+                delete_operation: None,
+                delete_attempts: 0,
+                bootstrap_used: false,
+                runner_id: None,
+                job_id: None,
+                retire_reason: None,
+                created_at: now,
+                updated_at: now,
             };
-            self.launch_single_worker(req, summary).await?;
+
+            self.store.upsert_worker(&worker).await?;
+            planned.push(PlannedLaunch {
+                pool_id: pool_id.to_owned(),
+                disk_gb: pool.disk_gb,
+                lifetime_seconds: pool.lifetime_seconds,
+                cache_url: self.config.worker_cache_url(pool).map(str::to_owned),
+                placement: placement.clone(),
+                worker,
+                now,
+            });
+        }
+
+        let results: Vec<_> = stream::iter(planned)
+            .map(|launch| self.execute_planned_launch(launch))
+            .buffer_unordered(MAX_CONCURRENT_LAUNCHES)
+            .collect()
+            .await;
+
+        for result in results {
+            match result {
+                Ok(LaunchOutcome::Created) => summary.workers_created += 1,
+                Ok(LaunchOutcome::Retired) => summary.workers_retired += 1,
+                Err(err) => {
+                    tracing::error!(pool = %pool_id, error = %err, "worker launch failed");
+                }
+            }
         }
         Ok(())
     }
 
-    async fn launch_single_worker(
+    async fn execute_planned_launch(
         &self,
-        req: LaunchRequest<'_>,
-        summary: &mut ReconcileSummary,
-    ) -> Result<(), ServerError> {
-        let LaunchRequest {
+        launch: PlannedLaunch,
+    ) -> Result<LaunchOutcome, ServerError> {
+        let PlannedLaunch {
             pool_id,
-            pool,
-            placement_idx,
+            disk_gb,
+            lifetime_seconds,
+            cache_url,
             placement,
-            admission_id,
+            mut worker,
             now,
-        } = req;
-        let short_id = &Uuid::new_v4().simple().to_string()[..12];
-        let worker_name = format!("open-ci-{pool_id}-{short_id}");
-        let request_id = Uuid::new_v4().to_string();
-
-        let mut worker = Worker {
-            name: worker_name,
-            pool_id: pool_id.to_owned(),
-            admission_id,
-            request_id: request_id.clone(),
-            provider: placement.provider,
-            placement_index: placement_idx,
-            region: placement.region.clone(),
-            zone: placement.zone.clone(),
-            machine_type: placement.machine_type.clone(),
-            provider_instance_id: None,
-            phase: WorkerPhase::Planned,
-            create_operation: None,
-            delete_operation: None,
-            delete_attempts: 0,
-            bootstrap_used: false,
-            runner_id: None,
-            job_id: None,
-            retire_reason: None,
-            created_at: now,
-            updated_at: now,
-        };
-
-        // Persist Planned intent BEFORE calling the cloud API so crashes remain idempotent.
-        self.store.upsert_worker(&worker).await?;
+        } = launch;
 
         let user_data = render_user_data(
             &self.secrets.bootstrap_secret,
             &self.config.server.public_url,
             &worker.name,
-            pool.lifetime_seconds,
-            self.config.worker_cache_url(pool),
+            lifetime_seconds,
+            cache_url.as_deref(),
         )?;
         let provider = self.providers.get(placement.provider)?;
         let spec = InstanceSpec {
             worker_name: worker.name.clone(),
-            pool_id: pool_id.to_owned(),
-            request_id,
+            pool_id: pool_id.clone(),
+            request_id: worker.request_id.clone(),
             placement: placement.clone(),
-            disk_gb: pool.disk_gb,
-            lifetime_seconds: pool.lifetime_seconds,
-            expires_at_unix: now.saturating_add(pool.lifetime_seconds),
+            disk_gb,
+            lifetime_seconds,
+            expires_at_unix: now.saturating_add(lifetime_seconds),
             user_data,
         };
 
@@ -156,21 +179,20 @@ impl ControlPlane {
                 self.store.upsert_worker(&worker).await?;
                 self.emit(ControlEvent::WorkerChanged {
                     worker: worker.name,
-                    pool_id: pool_id.to_owned(),
+                    pool_id,
                     phase: worker.phase,
                     timestamp: now,
                 });
-                summary.workers_created += 1;
+                Ok(LaunchOutcome::Created)
             }
             Err(err) => {
-                self.record_provider_backoff(placement, &err, now).await;
+                self.record_provider_backoff(&placement, &err, now).await;
                 worker.retire_reason = Some(RetireReason::CreateFailed.as_str().to_owned());
                 let _ = transition_phase(&mut worker, WorkerPhase::Retiring, now);
                 self.store.upsert_worker(&worker).await?;
-                summary.workers_retired += 1;
+                Ok(LaunchOutcome::Retired)
             }
         }
-        Ok(())
     }
 
     pub(super) async fn record_provider_backoff(

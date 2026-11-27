@@ -106,7 +106,7 @@ impl ControlPlane {
             return Err(ServerError::BootstrapUnavailable);
         };
 
-        if existing.phase != WorkerPhase::Live
+        if !matches!(existing.phase, WorkerPhase::Live | WorkerPhase::Creating)
             || existing.bootstrap_used
             || now >= existing.created_at.saturating_add(pool.idle_seconds)
         {

@@ -137,6 +137,13 @@ fn mock_placement(region: &str, zone: &str, machine_type: &str, subnet: &str) ->
         security_group: None,
         root_device: None,
         max_spot_price_usd: None,
+        core_count: None,
+        threads_per_core: None,
+        local_ssd_count: None,
+        network_bandwidth_tier: None,
+        ebs_iops: None,
+        ebs_throughput_mbps: None,
+        placement_group: None,
     }
 }
 
@@ -202,6 +209,7 @@ fn test_config(gh_url: String) -> OpenCiConfig {
         },
         gcp: None,
         aws: None,
+        cloud_hypervisor: None,
         cache: None,
         admission: AdmissionConfig {
             mode: AdmissionMode::Oidc,
@@ -1120,5 +1128,161 @@ async fn admission_rejects_when_pool_lifetime_worker_cap_is_exhausted() {
                 && d.target == "fallback"
                 && d.reason == open_ci_core::AdmissionReason::LifetimeLimit
                 && d.runners.get("api").map(String::as_str) == Some("ubuntu-latest")
+    ));
+}
+
+async fn setup_warm_webhook_harness(gh_url: String) -> Option<E2eHarness> {
+    let dir = tempdir().ok()?;
+    let clock = Arc::new(ManualClock::new(30_000));
+    let store = SqliteStore::open(&dir.path().join("open-ci.db"), 30_000).ok()?;
+    let mock = MockProvider::new(ProviderKind::Mock);
+    mock.set_sync_launches(true).await;
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(mock.clone()));
+
+    let mut cfg = test_config(gh_url.clone());
+    cfg.repository = None;
+    cfg.organization = Some("acme".to_owned());
+    cfg.allowed_repositories = vec!["acme/*".to_owned()];
+    cfg.admission.mode = AdmissionMode::Webhook;
+    cfg.github.oidc_trust = None;
+    if let Some(pool) = cfg.pools.get_mut("api") {
+        pool.min_idle_instances = 1;
+        pool.max_instances = 4;
+        pool.job_poll_seconds = 60;
+    }
+    assert!(cfg.validate().is_ok());
+
+    let scope = cfg.github_scope();
+    let secrets = ServerSecrets {
+        webhook_secret: SecretString::new("0123456789abcdef0123456789abcdef"),
+        bootstrap_secret: SecretString::new("fedcba9876543210fedcba9876543210"),
+        operator_token: Some(SecretString::new("operator-secret-token-12345678")),
+    };
+    let cp = ControlPlane::new(
+        cfg,
+        Arc::new(store.clone()),
+        registry,
+        GitHubClient::new(
+            gh_url,
+            scope,
+            reqwest::Client::new(),
+            Arc::new(StaticGitHubToken(SecretString::new("ghs_warm_test"))),
+        ),
+        None,
+        clock.clone(),
+        secrets.clone(),
+    )
+    .ok()?;
+    Some(E2eHarness {
+        _dir: dir,
+        clock,
+        store,
+        mock,
+        secrets,
+        cp,
+    })
+}
+
+#[tokio::test]
+async fn warm_pool_webhook_ingests_in_progress_and_completed_and_wakes_reconciler() {
+    let gh_state = Arc::new(Mutex::new(OrgFakeGitHubState::default()));
+    let gh_url = start_org_fake_github(Arc::clone(&gh_state)).await;
+    let harness = setup_warm_webhook_harness(gh_url).await;
+    assert!(harness.is_some());
+    let Some(E2eHarness {
+        _dir,
+        store,
+        secrets,
+        cp,
+        ..
+    }) = harness
+    else {
+        return;
+    };
+    let app = build_router(cp.clone());
+    let notifier = cp.reconcile_notifier();
+
+    let s1 = cp.reconcile_once().await.ok();
+    assert!(matches!(s1, Some(s) if s.workers_created == 1));
+    let workers = store.list_workers(Some("api")).await.unwrap_or_default();
+    assert_eq!(workers.len(), 1);
+    let warm_name = workers[0].name.clone();
+    assert_eq!(workers[0].phase, WorkerPhase::Live);
+
+    let in_progress = serde_json::to_vec(&json!({
+        "action": "in_progress",
+        "repository": { "full_name": "acme/service-a" },
+        "workflow_job": {
+            "id": 901,
+            "run_id": 401,
+            "run_attempt": 1,
+            "labels": ["self-hosted", "open-ci-api"],
+            "runner_name": warm_name,
+            "runner_id": 9101
+        }
+    }))
+    .unwrap_or_default();
+    assert_eq!(
+        send_signed_webhook(&app, &secrets.webhook_secret, &in_progress).await,
+        Some(StatusCode::ACCEPTED)
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), notifier.notified())
+            .await
+            .is_ok()
+    );
+
+    let jobs = store.list_jobs(Some("api")).await.unwrap_or_default();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, open_ci_core::JobStatus::InProgress);
+    assert_eq!(jobs[0].runner_name.as_deref(), Some(warm_name.as_str()));
+    assert_eq!(jobs[0].runner_id, Some(9101));
+
+    let s2 = cp.reconcile_once().await.ok();
+    assert!(matches!(s2, Some(s) if s.workers_created == 1));
+    let workers_after = store.list_workers(Some("api")).await.unwrap_or_default();
+    assert_eq!(workers_after.len(), 2);
+    assert!(
+        workers_after
+            .iter()
+            .any(|w| w.name == warm_name && w.job_id == Some(901) && w.phase == WorkerPhase::Live)
+    );
+
+    let completed = serde_json::to_vec(&json!({
+        "action": "completed",
+        "repository": { "full_name": "acme/service-a" },
+        "workflow_job": {
+            "id": 901,
+            "run_id": 401,
+            "run_attempt": 1,
+            "labels": ["self-hosted", "open-ci-api"],
+            "conclusion": "success",
+            "runner_name": warm_name,
+            "runner_id": 9101
+        }
+    }))
+    .unwrap_or_default();
+    assert_eq!(
+        send_signed_webhook(&app, &secrets.webhook_secret, &completed).await,
+        Some(StatusCode::ACCEPTED)
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), notifier.notified())
+            .await
+            .is_ok()
+    );
+
+    let jobs_done = store.list_jobs(Some("api")).await.unwrap_or_default();
+    assert_eq!(jobs_done[0].status, open_ci_core::JobStatus::Completed);
+    assert_eq!(jobs_done[0].conclusion.as_deref(), Some("success"));
+
+    let s3 = cp.reconcile_once().await.ok();
+    assert!(matches!(s3, Some(s) if s.workers_retired == 1 && s.workers_created == 0));
+    let retired = store.get_worker(&warm_name).await.ok().flatten();
+    assert!(matches!(
+        retired,
+        Some(w) if w.phase == WorkerPhase::Retiring
+            && w.retire_reason.as_deref() == Some("job_completed")
     ));
 }
