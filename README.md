@@ -46,7 +46,7 @@
 
 - **85–90% lower compute spend, zero SaaS tax.** Pay raw AWS and GCP Spot (or On-Demand) rates, burn existing cloud credits, and run the entire control plane on a single `~$12–$15/mo` VM (`t4g.small` or `e2-small`). Zero per-seat fees, zero cache markup.
 - **Faster builds out of the box.** Ships with a native **GitHub Actions Cache v2** server (`open-ci cache`, verified against the official `@actions/cache` client) backed by local NVMe, S3/R2/MinIO, or native GCS with keyless VM credentials and an optional bounded RAM hot tier (`hot_cache_bytes`) — plus boot-time auto-NVMe `ext4`/RAID0 mounting for Docker layers, `RUNNER_WORKDIR`, and `TMPDIR`.
-- **Drop-in or fail-closed routing.** Change a single line (`runs-on: open-ci-linux-x64`) with `admission.mode = "webhook"`, or route via [`katchlabs/open-ci/actions/route@v0.2.0`](actions/route) in `oidc` / `hybrid` mode so controller downtime, drains, reruns, or capacity limits fall back cleanly to `ubuntu-latest` without breaking CI.
+- **Drop-in or fail-closed routing.** Change a single line (`runs-on: open-ci-linux-x64`) with `admission.mode = "webhook"`, or route via [`katchlabs/open-ci/actions/route@v0.2.1`](actions/route) in `oidc` / `hybrid` mode so controller downtime, drains, reruns, or capacity limits fall back cleanly to `ubuntu-latest` without breaking CI.
 - **Multi-cloud without Kubernetes or CLI bloat.** Pure-Rust AWS EC2 + STS SigV4/XML and GCP Compute Engine REST adapters spill automatically across regions, families, and clouds on Spot stockout. Native keyless cloud identity (`IMDSv2`, STS `AssumeRole` + `ExternalId`, GCE metadata, IAM SA impersonation, and keyless GCP→AWS web identity federation) plus org-wide multi-repo pools.
 - **Zero-IAM, hard-bounded workers.** Every ephemeral runner boots with zero cloud IAM (`serviceAccounts: []` on GCP; no instance profile + IMDSv2 enforced on AWS), zero inbound ports, single-use atomic HMAC bootstrap tokens, and triple-layer hard expiry (`reconciler` + `maxRunDuration`/`open-ci-aws-janitor` + guest `poweroff`).
 - **Single binary, strict Rust safety.** Compiles to static-friendly `x86_64` and `aarch64` Linux binaries and multi-arch GHCR containers under `unsafe_code = "forbid"`, `clippy::unwrap_used = "deny"`, `expect_used = "deny"`, and `panic = "deny"`.
@@ -150,7 +150,7 @@ jobs:
       runners: ${{ steps.route.outputs.runners }}
     steps:
       - id: route
-        uses: katchlabs/open-ci/actions/route@v0.2.0
+        uses: katchlabs/open-ci/actions/route@v0.2.1
         with:
           endpoint: https://ci.example.com/v1/ingress/admit
           audience: open-ci:example-org/example-repo
@@ -260,7 +260,7 @@ We prefer clear engineering boundaries over marketing claims:
 | :---: | --- | --- |
 | ✓ | Multi-cloud AWS + GCP Spot & On-Demand | Pure-Rust SigV4/XML EC2 + Compute Engine REST |
 | ✓ | Org-wide & multi-repo runner pools | `organization`, `allowed_repositories`, `runner_group_id` |
-| ✓ | `webhook`, `oidc`, and `hybrid` admission | Drop-in webhooks or fail-closed `actions/route@v0.2.0` |
+| ✓ | `webhook`, `oidc`, and `hybrid` admission | Drop-in webhooks or fail-closed `actions/route@v0.2.1` |
 | ✓ | Native Actions Cache v2 (`open-ci cache`) | Local NVMe, S3/R2/MinIO, native GCS; verified with `@actions/cache` |
 | ✓ | Auto-NVMe RAID0/ext4 & BuildKit tuning | `x64` & `arm64` Ubuntu 24.04 Packer templates |
 | ✓ | Keyless BYOC cloud identity | `IMDSv2`, STS `AssumeRole` + `ExternalId`, GCE metadata, SA impersonation, GCP→AWS federation |
