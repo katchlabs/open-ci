@@ -687,3 +687,91 @@ async fn gce_web_identity_rejects_invalid_config_before_any_request() {
     }
     assert_eq!(state.metadata_calls.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn two_hop_gce_web_identity_chains_into_customer_assume_role_with_external_id() {
+    let hub_state = WebIdentityState::default();
+    let Some(hub_addr) = spawn_web_identity(&hub_state).await else {
+        panic_free_fail("failed to bind hub mock server");
+        return;
+    };
+
+    let customer_sts_calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_router = Arc::clone(&customer_sts_calls);
+    let customer_router =
+        Router::new().route(
+            "/",
+            post(move |headers: HeaderMap, body: String| {
+                let calls = Arc::clone(&calls_for_router);
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=ASIA_WEB_1/"));
+                    assert!(auth.contains("x-amz-security-token"));
+                    let sec_tok = headers
+                        .get("x-amz-security-token")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    assert_eq!(sec_tok, "WEB_TOK_1");
+                    assert!(body.contains("Action=AssumeRole"));
+                    assert!(body.contains(
+                        "RoleArn=arn%3Aaws%3Aiam%3A%3A999988887777%3Arole%2Fopen-ci-byoc"
+                    ));
+                    assert!(body.contains("RoleSessionName=open-ci-tenant-acme"));
+                    assert!(body.contains("ExternalId=ext-id-123"));
+
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+                      <AssumeRoleResult>\
+                        <Credentials>\
+                          <AccessKeyId>ASIA_CUSTOMER_1</AccessKeyId>\
+                          <SecretAccessKey>CUSTOMER_SECRET_1</SecretAccessKey>\
+                          <SessionToken>CUSTOMER_TOK_1</SessionToken>\
+                          <Expiration>2023-11-14T22:23:20Z</Expiration>\
+                        </Credentials>\
+                      </AssumeRoleResult>\
+                    </AssumeRoleResponse>"
+                            .to_owned(),
+                    )
+                }
+            }),
+        );
+
+    let Some(customer_sts_addr) = spawn_mock_server(customer_router).await else {
+        panic_free_fail("failed to bind customer sts mock server");
+        return;
+    };
+
+    let clock = Arc::new(ManualClock::new(1_700_000_000));
+    let hub_cfg = web_identity_config(hub_addr);
+    let customer_cfg = AssumeRoleConfig::new(
+        "arn:aws:iam::999988887777:role/open-ci-byoc",
+        "open-ci-tenant-acme",
+    )
+    .with_external_id("ext-id-123")
+    .with_sts_endpoint(format!("http://{customer_sts_addr}/"));
+
+    let source = StsAssumeRoleCredentials::over_gce_web_identity_with_clock(
+        hub_cfg,
+        customer_cfg,
+        Client::new(),
+        clock,
+    );
+
+    let creds = source.credentials().await;
+    assert!(matches!(
+        creds,
+        Ok(ref c)
+            if c.access_key_id == "ASIA_CUSTOMER_1"
+                && c.session_token
+                    .as_ref()
+                    .is_some_and(|t| t.expose() == "CUSTOMER_TOK_1")
+    ));
+    assert_eq!(hub_state.metadata_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hub_state.sts_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(customer_sts_calls.load(Ordering::SeqCst), 1);
+}

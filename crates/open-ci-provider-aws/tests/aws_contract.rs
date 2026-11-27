@@ -133,6 +133,7 @@ fn instance_spec(worker_name: &str, placement: Placement) -> InstanceSpec {
         lifetime_seconds: 1800,
         expires_at_unix: 1_700_001_800,
         user_data: "#!/bin/sh\n".to_owned(),
+        tenant_id: None,
     }
 }
 
@@ -255,4 +256,90 @@ async fn run_instances_wires_cpu_options_ebs_tuning_and_placement_group() {
         assert!(tuned_body.contains("BlockDeviceMapping.1.Ebs.Throughput=1000"));
         assert!(tuned_body.contains("Placement.GroupName=ci-cluster-pg"));
     }
+}
+
+#[tokio::test]
+async fn aws_paginates_instances_and_volumes_and_tags_tenant_id() {
+    let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture_clone = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/",
+        post(move |body: String| {
+            let capture_clone = Arc::clone(&capture_clone);
+            async move {
+                capture_clone.lock().await.push(body.clone());
+                if body.contains("Action=RunInstances") {
+                    return (
+                        StatusCode::OK,
+                        "<RunInstancesResponse><instancesSet><item><instanceId>i-tenant1</instanceId><instanceState><name>pending</name></instanceState><placement><availabilityZone>us-east-1a</availabilityZone></placement></item></instancesSet></RunInstancesResponse>".to_owned(),
+                    );
+                }
+                if body.contains("Action=DescribeInstances") {
+                    if body.contains("NextToken=page2") {
+                        return (
+                            StatusCode::OK,
+                            "<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-page2</instanceId><instanceState><name>running</name></instanceState><placement><availabilityZone>us-east-1a</availabilityZone></placement><tagSet><item><key>Name</key><value>open-ci-w2</value></item><item><key>open-ci-pool</key><value>default</value></item></tagSet></item></instancesSet></item></reservationSet></DescribeInstancesResponse>".to_owned(),
+                        );
+                    }
+                    return (
+                        StatusCode::OK,
+                        "<DescribeInstancesResponse><nextToken>page2</nextToken><reservationSet><item><instancesSet><item><instanceId>i-page1</instanceId><instanceState><name>running</name></instanceState><placement><availabilityZone>us-east-1a</availabilityZone></placement><tagSet><item><key>Name</key><value>open-ci-w1</value></item><item><key>open-ci-pool</key><value>default</value></item></tagSet></item></instancesSet></item></reservationSet></DescribeInstancesResponse>".to_owned(),
+                    );
+                }
+                if body.contains("Action=DescribeVolumes") {
+                    if body.contains("NextToken=volpage2") {
+                        return (
+                            StatusCode::OK,
+                            "<DescribeVolumesResponse><volumeSet><item><volumeId>vol-2</volumeId><status>available</status></item></volumeSet></DescribeVolumesResponse>".to_owned(),
+                        );
+                    }
+                    return (
+                        StatusCode::OK,
+                        "<DescribeVolumesResponse><nextToken>volpage2</nextToken><volumeSet><item><volumeId>vol-1</volumeId><status>available</status></item></volumeSet></DescribeVolumesResponse>".to_owned(),
+                    );
+                }
+                (StatusCode::BAD_REQUEST, "<Response/>".to_owned())
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.ok();
+    assert!(listener.is_some());
+    let Some(listener) = listener else { return };
+    let addr = listener.local_addr().ok();
+    assert!(addr.is_some());
+    let Some(addr) = addr else { return };
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let provider = test_provider(addr);
+    let mut spec = instance_spec("tenant-worker", test_placement(true));
+    spec.tenant_id = Some("tenant-acme".to_owned());
+    assert!(provider.create_instance(&spec).await.is_ok());
+
+    let instances = provider
+        .describe_managed_instances_filtered("us-east-1", Some("default"), Some("tenant-acme"))
+        .await;
+    assert!(matches!(
+        instances,
+        Ok(ref list) if list.len() == 2 && list[0].instance_id == "i-page1" && list[1].instance_id == "i-page2"
+    ));
+
+    let volumes = provider
+        .describe_managed_volumes_filtered("us-east-1", None, Some("tenant-acme"))
+        .await;
+    assert!(matches!(
+        volumes,
+        Ok(ref list) if list.len() == 2 && list[0].volume_id == "vol-1" && list[1].volume_id == "vol-2"
+    ));
+
+    let bodies = captured.lock().await;
+    assert!(bodies[0].contains("TagSpecification.1.Tag.5.Key=open-ci-tenant"));
+    assert!(bodies[0].contains("TagSpecification.1.Tag.5.Value=tenant-acme"));
+    assert!(bodies[0].contains("TagSpecification.2.Tag.5.Key=open-ci-tenant"));
+    assert!(bodies[0].contains("TagSpecification.2.Tag.5.Value=tenant-acme"));
+    assert!(bodies[1].contains("Filter.3.Name=tag%3Aopen-ci-tenant"));
+    assert!(bodies[1].contains("Filter.3.Value.1=tenant-acme"));
+    assert!(bodies[3].contains("Filter.2.Name=tag%3Aopen-ci-tenant"));
 }

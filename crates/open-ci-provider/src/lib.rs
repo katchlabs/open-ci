@@ -52,6 +52,7 @@ pub struct InstanceSpec {
     pub lifetime_seconds: u64,
     pub expires_at_unix: u64,
     pub user_data: String,
+    pub tenant_id: Option<String>,
 }
 
 /// Reference to an asynchronous cloud operation (e.g., GCP zone operation).

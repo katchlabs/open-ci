@@ -157,18 +157,54 @@ impl AwsProvider {
         region: &str,
         pool_id: Option<&str>,
     ) -> Result<Vec<ParsedEc2Instance>, ProviderError> {
-        let mut params = vec![
+        self.describe_managed_instances_filtered(region, pool_id, None)
+            .await
+    }
+
+    /// Lists raw EC2 instances managed by `open-ci` with bounded `NextToken` pagination
+    /// and optional pool and tenant tag filters.
+    pub async fn describe_managed_instances_filtered(
+        &self,
+        region: &str,
+        pool_id: Option<&str>,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<ParsedEc2Instance>, ProviderError> {
+        const MAX_LIST_PAGES: usize = 50;
+        let mut base_params = vec![
             ("Action", "DescribeInstances".to_owned()),
             ("Version", "2016-11-15".to_owned()),
             ("Filter.1.Name", "tag:open-ci-managed".to_owned()),
             ("Filter.1.Value.1", "true".to_owned()),
         ];
         if let Some(pool) = pool_id {
-            params.push(("Filter.2.Name", "tag:open-ci-pool".to_owned()));
-            params.push(("Filter.2.Value.1", pool.to_owned()));
+            base_params.push(("Filter.2.Name", "tag:open-ci-pool".to_owned()));
+            base_params.push(("Filter.2.Value.1", pool.to_owned()));
         }
-        let xml = self.call_query("ec2", region, &params, None).await?;
-        Ok(xml::parse_instances(&xml))
+        if let Some(tenant) = tenant_id.filter(|t| !t.is_empty()) {
+            let (name_key, val_key) = if pool_id.is_some() {
+                ("Filter.3.Name", "Filter.3.Value.1")
+            } else {
+                ("Filter.2.Name", "Filter.2.Value.1")
+            };
+            base_params.push((name_key, "tag:open-ci-tenant".to_owned()));
+            base_params.push((val_key, tenant.to_owned()));
+        }
+
+        let mut out = Vec::new();
+        let mut next_token: Option<String> = None;
+        for _ in 0..MAX_LIST_PAGES {
+            let mut params = base_params.clone();
+            if let Some(token) = &next_token {
+                params.push(("NextToken", token.clone()));
+            }
+            let xml = self.call_query("ec2", region, &params, None).await?;
+            out.extend(xml::parse_instances(&xml));
+            next_token = xml::parse_next_token(&xml);
+            if next_token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Lists raw EBS volumes managed by `open-ci` in `region` (used by the Rust expiry janitor).
@@ -177,18 +213,54 @@ impl AwsProvider {
         region: &str,
         pool_id: Option<&str>,
     ) -> Result<Vec<ParsedEbsVolume>, ProviderError> {
-        let mut params = vec![
+        self.describe_managed_volumes_filtered(region, pool_id, None)
+            .await
+    }
+
+    /// Lists raw EBS volumes managed by `open-ci` with bounded `NextToken` pagination
+    /// and optional pool and tenant tag filters.
+    pub async fn describe_managed_volumes_filtered(
+        &self,
+        region: &str,
+        pool_id: Option<&str>,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<ParsedEbsVolume>, ProviderError> {
+        const MAX_LIST_PAGES: usize = 50;
+        let mut base_params = vec![
             ("Action", "DescribeVolumes".to_owned()),
             ("Version", "2016-11-15".to_owned()),
             ("Filter.1.Name", "tag:open-ci-managed".to_owned()),
             ("Filter.1.Value.1", "true".to_owned()),
         ];
         if let Some(pool) = pool_id {
-            params.push(("Filter.2.Name", "tag:open-ci-pool".to_owned()));
-            params.push(("Filter.2.Value.1", pool.to_owned()));
+            base_params.push(("Filter.2.Name", "tag:open-ci-pool".to_owned()));
+            base_params.push(("Filter.2.Value.1", pool.to_owned()));
         }
-        let xml = self.call_query("ec2", region, &params, None).await?;
-        Ok(xml::parse_volumes(&xml))
+        if let Some(tenant) = tenant_id.filter(|t| !t.is_empty()) {
+            let (name_key, val_key) = if pool_id.is_some() {
+                ("Filter.3.Name", "Filter.3.Value.1")
+            } else {
+                ("Filter.2.Name", "Filter.2.Value.1")
+            };
+            base_params.push((name_key, "tag:open-ci-tenant".to_owned()));
+            base_params.push((val_key, tenant.to_owned()));
+        }
+
+        let mut out = Vec::new();
+        let mut next_token: Option<String> = None;
+        for _ in 0..MAX_LIST_PAGES {
+            let mut params = base_params.clone();
+            if let Some(token) = &next_token {
+                params.push(("NextToken", token.clone()));
+            }
+            let xml = self.call_query("ec2", region, &params, None).await?;
+            out.extend(xml::parse_volumes(&xml));
+            next_token = xml::parse_next_token(&xml);
+            if next_token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Terminates a single EC2 instance by ID.

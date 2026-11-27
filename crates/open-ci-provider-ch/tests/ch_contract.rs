@@ -278,6 +278,7 @@ async fn unix_socket_wire_contract_create_boot_info_shutdown() {
             lifetime_seconds: 1800,
             expires_at_unix: 2000,
             user_data: user_data.to_owned(),
+            tenant_id: None,
         })
         .await;
     assert!(matches!(
