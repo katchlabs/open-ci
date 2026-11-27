@@ -1416,6 +1416,7 @@ dependencies = [
  "open-ci-github",
  "open-ci-provider",
  "open-ci-provider-aws",
+ "open-ci-provider-ch",
  "open-ci-provider-gcp",
  "open-ci-provider-mock",
  "open-ci-server",
@@ -1490,6 +1491,21 @@ dependencies = [
  "sha2 0.10.9",
  "time",
  "tokio",
+]
+
+[[package]]
+name = "open-ci-provider-ch"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "open-ci-core",
+ "open-ci-provider",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

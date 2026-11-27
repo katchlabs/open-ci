@@ -6,6 +6,7 @@ members = [
     "crates/open-ci-provider",
     "crates/open-ci-provider-gcp",
     "crates/open-ci-provider-aws",
+    "crates/open-ci-provider-ch",
     "crates/open-ci-provider-mock",
     "crates/open-ci-github",
     "crates/open-ci-server",
@@ -46,6 +47,7 @@ open-ci-store = { path = "crates/open-ci-store" }
 open-ci-provider = { path = "crates/open-ci-provider" }
 open-ci-provider-gcp = { path = "crates/open-ci-provider-gcp" }
 open-ci-provider-aws = { path = "crates/open-ci-provider-aws" }
+open-ci-provider-ch = { path = "crates/open-ci-provider-ch" }
 open-ci-provider-mock = { path = "crates/open-ci-provider-mock" }
 open-ci-github = { path = "crates/open-ci-github" }
 open-ci-server = { path = "crates/open-ci-server" }
