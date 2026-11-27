@@ -6,6 +6,7 @@ mod twirp;
 
 use crate::config::CacheConfig;
 use crate::error::CacheError;
+use crate::ids::BlobId;
 use crate::index::CacheIndex;
 use crate::retention;
 use crate::storage::BlobStore;
@@ -14,8 +15,9 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 use open_ci_core::Clock;
 use open_ci_github::RuntimeTokenVerifier;
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -35,6 +37,7 @@ pub struct CacheState {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) upstream: reqwest::Client,
     pub(crate) sweep_requested: Notify,
+    pub(crate) active_reservations: RwLock<HashMap<BlobId, u64>>,
 }
 
 /// GitHub Actions Cache Service v2 server.
@@ -65,6 +68,7 @@ impl CacheServer {
                 clock,
                 upstream,
                 sweep_requested: Notify::new(),
+                active_reservations: RwLock::new(HashMap::new()),
             }),
         })
     }

@@ -61,11 +61,14 @@ pub(super) async fn put_blob(
     body: Body,
 ) -> Result<Response, CacheError> {
     let blob = authorize(&state, &raw_id, BlobOp::Put, &query)?;
-    if !state
-        .index
-        .accepts_upload(blob.clone(), state.clock.now_unix())
-        .await?
-    {
+    let now = state.clock.now_unix();
+    let fast_accepted = state
+        .active_reservations
+        .read()
+        .ok()
+        .and_then(|active| active.get(&blob).copied())
+        .is_some_and(|stale_after| stale_after > now);
+    if !fast_accepted && !state.index.accepts_upload(blob.clone(), now).await? {
         return Err(CacheError::Forbidden(
             "upload is not reserved or was already finalized".to_owned(),
         ));

@@ -5,6 +5,7 @@
 
 pub mod gcs;
 pub mod local;
+pub mod memory;
 pub mod s3;
 
 use crate::error::CacheError;
@@ -16,6 +17,7 @@ use std::io;
 
 pub use gcs::{GcsBlobStore, GcsStoreConfig};
 pub use local::LocalBlobStore;
+pub use memory::HotMemoryBlobStore;
 pub use s3::{S3BlobStore, S3StoreConfig};
 
 /// Fallible stream of body bytes moving between HTTP and a backend without full buffering.
@@ -56,6 +58,13 @@ impl BlobUpload {
 
     pub fn into_stream(self) -> ByteStream {
         self.body.0
+    }
+
+    pub(crate) fn map_stream(self, f: impl FnOnce(ByteStream) -> ByteStream) -> Self {
+        Self {
+            content_length: self.content_length,
+            body: SizedStream(f(self.body.0)),
+        }
     }
 }
 

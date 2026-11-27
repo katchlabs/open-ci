@@ -42,11 +42,15 @@ pub(super) async fn create_cache_entry(
     let url_expires = now.saturating_add(ttl);
     let blob = BlobId::generate();
 
+    let stale_after = url_expires.saturating_add(ttl);
     let (reservation, replaced) = state
         .index
-        .reserve(entry, blob.clone(), now, url_expires.saturating_add(ttl))
+        .reserve(entry, blob.clone(), now, stale_after)
         .await?;
     if let Some(stale) = replaced {
+        if let Ok(mut active) = state.active_reservations.write() {
+            active.remove(&stale);
+        }
         delete_quietly(&state, &stale).await;
     }
     if reservation == Reservation::AlreadyExists {
@@ -61,6 +65,9 @@ pub(super) async fn create_cache_entry(
         BlobOp::Put,
         url_expires,
     )?;
+    if let Ok(mut active) = state.active_reservations.write() {
+        active.insert(blob, stale_after);
+    }
     Ok(Json(CreateCacheEntryResponse {
         ok: true,
         signed_upload_url,
@@ -93,6 +100,9 @@ pub(super) async fn finalize_cache_entry_upload(
         .take_reservation(entry.clone())
         .await?
         .ok_or_else(|| CacheError::NotFound("no pending upload for this key".to_owned()))?;
+    if let Ok(mut active) = state.active_reservations.write() {
+        active.remove(&blob);
+    }
 
     let published = publish(&state, entry, &blob, req.size_bytes).await;
     if published.is_err() {
