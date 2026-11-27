@@ -30,6 +30,7 @@ flowchart TB
         PROV["open-ci-provider (CloudProvider trait + ProviderRegistry)"]
         PAWS["open-ci-provider-aws"]
         PGCP["open-ci-provider-gcp"]
+        PCH["open-ci-provider-ch"]
         PMOCK["open-ci-provider-mock"]
     end
 
@@ -51,6 +52,7 @@ flowchart TB
 
     PROV --> PAWS
     PROV --> PGCP
+    PROV --> PCH
     PROV --> PMOCK
     PAWS --> AWS
     PGCP --> GCP
@@ -65,21 +67,22 @@ flowchart TB
 
 ---
 
-## Crate Responsibilities (11 Workspace Crates)
+## Crate Responsibilities (12 Workspace Crates)
 
 Workspace-wide lints in `Cargo.toml` enforce `unsafe_code = "forbid"`, `clippy::unwrap_used = "deny"`, `clippy::expect_used = "deny"`, `clippy::panic = "deny"`, `clippy::todo = "deny"`, `clippy::unimplemented = "deny"`, and `clippy::pedantic = "warn"`.
 
 | Crate | Role | Key Types & Guarantees |
 | --- | --- | --- |
 | `open-ci-core` | Pure zero-I/O domain model | `OpenCiConfig` (`#[serde(deny_unknown_fields)]`), `GitHubScope`, `AdmissionMode`, `evaluate_admission`, `evaluate_webhook_admission`, `WorkerPhase` state machine, `evaluate_retirement`, `plan_scale_up`, `select_placement`, `SecretString`, `Clock` / `ManualClock`. Verified with `proptest` in `tests/invariants.rs`. |
-| `open-ci-store` | Durable async state storage | `Store` trait and `SqliteStore` using `tokio::task::spawn_blocking`, WAL mode, `fs2` exclusive lockfile fencing, `0o600` pre-creation, normalized migrations, and consistent online backups. |
+| `open-ci-store` | Durable async state storage | `Store` trait and `SqliteStore` using `tokio::task::spawn_blocking`, WAL mode, `fs2` exclusive lockfile fencing, `0o600` pre-creation, monotonic phase/status upserts, normalized migrations, and consistent online backups. |
 | `open-ci-provider` | Cloud provider port | `CloudProvider` trait (`create_instance`, `get_operation`, `delete_instance`, `list_instances`, `list_orphan_disks`, `delete_disk`, `health_check`), `InstanceSpec`, `ProviderError`, `ProviderRegistry`. |
-| `open-ci-provider-aws` | Native AWS EC2 & STS adapter | Pure-Rust SigV4 signing (`sigv4.rs`), EC2 Query API params (`params.rs`), XML response parsing (`xml.rs`), Spot & On-Demand launch, IMDSv2 enforcement, `AwsCredentialChain` (`Env` → `IMDSv2` → optional STS `AssumeRole` with `ExternalId`). |
-| `open-ci-provider-gcp` | Native GCP Compute Engine adapter | Direct Compute Engine REST JSON client, Spot & On-Demand VMs, `maxRunDuration` + `instanceTerminationAction: DELETE`, `serviceAccounts: []`, Shielded VM config, `FileTokenSource` / `MetadataTokenSource` / `ImpersonatedTokenSource` (IAM Credentials API). |
+| `open-ci-provider-aws` | Native AWS EC2 & STS adapter | Pure-Rust SigV4 signing (`sigv4.rs`), EC2 Query API params (`params.rs`), XML response parsing (`xml.rs`), Spot & On-Demand launch, hardware placement tuning, IMDSv2 enforcement, `AwsCredentialChain` (`Env` → `IMDSv2` → optional STS `AssumeRole` with `ExternalId`). |
+| `open-ci-provider-gcp` | Native GCP Compute Engine adapter | Direct Compute Engine REST JSON client, Spot & On-Demand VMs, Hyperdisk/Local SSD/gVNIC/Tier-1/SMT controls, `maxRunDuration` + `instanceTerminationAction: DELETE`, `serviceAccounts: []`, Shielded VM config, `FileTokenSource` / `MetadataTokenSource` / `ImpersonatedTokenSource` (IAM Credentials API). |
+| `open-ci-provider-ch` | Native Cloud Hypervisor adapter | Pure-Rust Unix-socket HTTP/1.1 client for `cloud-hypervisor` microVMs, XFS reflink CoW rootfs clones, `0o600` `/dev/vdb` bootstrap seed images, TAP/bridge networking, and optional physical-core pinning. |
 | `open-ci-provider-mock` | Deterministic test & demo provider | In-memory fault-injecting `MockProvider` supporting quota/stockout simulation, used in integration tests and `open-ci demo`. |
 | `open-ci-github` | GitHub integration & security | Bounded-pagination REST client supporting repo-level and org-level JIT registration (`runner_group_id`), constant-time HMAC-SHA256 webhook verification, RS256 OIDC JWT verifier with lock-free singleflight JWKS refresh, and privilege-separated `rotate_credentials` broker. |
-| `open-ci-server` | Control plane & HTTP server | Non-blocking `ControlPlane`, background reconciler (`scale_up`, `worker_lifecycle`, `orphans`), single-use HMAC bootstrap handler, public machine ingress, bearer-authenticated Operator API, SSE broadcast stream, and Prometheus metrics. |
-| `open-ci-cache` | Native Actions v2 cache server | Axum server implementing GitHub Actions Cache v2 Twirp RPCs and Azure-compatible single-shot/block blob endpoints, runtime-token authorization with ref-scoped immutable entries, signed capability URLs, a `SQLite` index with retention, streaming `local`/`s3`/`gcs` `BlobStore` backends, and results-service passthrough. |
+| `open-ci-server` | Control plane & HTTP server | Non-blocking `ControlPlane`, event-driven + periodic reconciler with bounded parallel scale-up (`buffer_unordered(8)`), single-use HMAC bootstrap handler, public machine ingress, bearer-authenticated Operator API, SSE broadcast stream, and Prometheus metrics. |
+| `open-ci-cache` | Native Actions v2 cache server | Axum server implementing GitHub Actions Cache v2 Twirp RPCs and Azure-compatible single-shot/block blob endpoints, runtime-token authorization with ref-scoped immutable entries, signed capability URLs, `SQLite` index with retention, optional bounded RAM `HotMemoryBlobStore`, zero-copy local block manifests, streaming `local`/`s3`/`gcs` `BlobStore` backends, and results-service passthrough. |
 | `open-ci-aws-janitor` | Independent AWS expiry guard | Standalone Rust CLI and AWS Lambda (`provided.al2023` custom runtime loop) sweeping expired `open-ci-managed=true` EC2 instances and detached EBS volumes with per-resource error isolation and fail-closed tag parsing. |
 | `open-ci-cli` | Thin CLI & worker agent binary | Subcommands: `serve`, `cache`, `demo`, `validate`, `ctl`, `backup`, `rotate-credentials`, `agent bootstrap`. |
 
@@ -197,8 +200,8 @@ When `[cache]` is configured in `open-ci.toml` and `OPEN_CI_CACHE_SIGNING_KEY_FI
 3. Official `actions/cache`, `setup-*` caching, `Swatinem/rust-cache`, and BuildKit `type=gha` call `open-ci cache` with the job's own `ACTIONS_RUNTIME_TOKEN`. The server verifies it (RS256 via the issuer JWKS, `iss`, `exp`, optional `aud`), requires its `repository_id` to be in `cache.auth.repositories`, and reads its `ac` ref grants.
 4. Entries are immutable and keyed by `(repository_id, ref scope, version, key)`, exactly like GitHub: a job saves only into its writable ref (a PR writes `refs/pull/N/merge`, never `main`) and restores from its own ref first, then the read-only base/default refs; per ref it tries each key exact, then newest prefix. A duplicate save returns `409`.
 5. Every other Twirp call (for example `ArtifactService`, used by `upload-artifact@v4`) is forwarded unchanged to `cache.upstream_results_url` (`https://results-receiver.actions.githubusercontent.com` by default).
-6. Metadata lives in a `SQLite` index (`cache.index_path`). Archives stream through a pluggable `BlobStore`; nothing buffers whole archives in memory:
-   - **`local`** — local disk/NVMe directory with atomic `0o600` writes.
+6. Metadata lives in a `SQLite` index (`cache.index_path`). Archives stream through a pluggable `BlobStore` with an optional bounded RAM LRU tier (`cache.hot_cache_bytes`, `HotMemoryBlobStore` enforcing a unified committed + in-flight memory budget with lock-free concurrent reads):
+   - **`local`** — local disk/NVMe directory with atomic `0o600` writes and zero-copy `.manifest` block assembly (avoids rewriting multi-part uploads on commit while pinning block file descriptors during reads).
    - **`s3`** — native SigV4 S3 API (AWS S3, R2, MinIO). Credentials: `instance` (IMDSv2 role, default), `environment`, or `assume_role`. Staged blocks are joined server-side with multipart `UploadPartCopy`. Add an `AbortIncompleteMultipartUpload` bucket lifecycle rule so uploads interrupted by a crash are reclaimed. R2 requires equal-sized parts, which holds for the toolkit's uniform block size but not for clients that stage uneven blocks.
    - **`gcs`** — native GCS JSON API. Credentials: `metadata` (VM service account, default), `impersonate`, or `token_file`. Staged blocks are joined server-side with `compose`.
 7. Upload URLs accept bytes only while their reservation is live: after finalize (or once a reservation goes stale) every `PUT` is rejected, so a committed entry can never be rewritten. Block commits run to completion even if the client disconnects, block lists are capped at Azure's 50,000 blocks, and storage requests fail after 60 s without progress instead of hanging.
@@ -208,11 +211,11 @@ When `[cache]` is configured in `open-ci.toml` and `OPEN_CI_CACHE_SIGNING_KEY_FI
 
 Packer-built Ubuntu 24.04 images (`x64` and `arm64`) install `/usr/local/sbin/open-ci-setup-nvme.sh` as `open-ci-nvme.service` (`Before=docker.service`):
 
-1. Resolves the root block device via `findmnt`/`lsblk` and explicitly excludes network-attached persistent volumes (`Elastic Block Store`, `PersistentDisk`) and partitioned disks.
-2. Formats a single local NVMe drive with `ext4` (`-O ^has_journal`, `noatime,nodiratime`) or stripes 2+ local NVMe drives into `/dev/md0` RAID0 (`mdadm --chunk=256`).
+1. Resolves the root block device via `findmnt`/`lsblk` and explicitly excludes network-attached persistent volumes (`Elastic Block Store`, `PersistentDisk`, `Persistent Disk`, `Hyperdisk`, `nvme_card-pd`) and partitioned disks.
+2. Uses a single local NVMe drive or stripes 2+ local NVMe drives into `/dev/md0` RAID0 (`mdadm --chunk=256`). Under `OPEN_CI_NVME_PAGE_CACHE=auto` (default), hosts with `>= 14 GiB` RAM mount an XFS-backed 4K-sector `ext4` image sized to 85% of the NVMe volume for page-cache-accelerated I/O; smaller VMs mount direct `ext4` (`-O ^has_journal`, `noatime,nodiratime`).
 3. Mounts at `/mnt/nvme`, creates `/mnt/nvme/docker`, `/mnt/nvme/work`, `/mnt/nvme/tmp`, and rewrites `/etc/docker/daemon.json` to set `"data-root": "/mnt/nvme/docker"`.
 4. `open-ci agent bootstrap` probes `/mnt/nvme/work` and `/mnt/nvme/tmp` for writability and injects `RUNNER_WORKDIR=/mnt/nvme/work` and `TMPDIR=/mnt/nvme/tmp`.
-5. `/etc/sysctl.d/99-open-ci.conf` raises `fs.inotify.max_user_watches=524288`, `fs.inotify.max_user_instances=1024`, and lowers `vm.swappiness=10`; Docker runs `overlay2` with BuildKit enabled and 10 concurrent pulls/pushes.
+5. `/etc/sysctl.d/99-open-ci.conf` raises `fs.inotify.max_user_watches=524288`, `fs.inotify.max_user_instances=1024`, configures `fq` + `cubic` with 64 MiB max TCP buffers, and lowers `vm.swappiness=1`; Docker runs `overlay2` with BuildKit enabled and 10 concurrent pulls/pushes.
 
 ---
 

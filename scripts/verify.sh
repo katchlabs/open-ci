@@ -81,6 +81,8 @@ cargo test --workspace
 gate "Gate 3/7: Offline Config Validation"
 
 cargo run --quiet --bin open-ci -- validate --config config/open-ci.example.toml
+cargo run --quiet --bin open-ci -- validate --config config/open-ci.high-perf.example.toml
+cargo run --quiet --bin open-ci -- validate --config config/open-ci.cloud-hypervisor.example.toml
 
 # ---------------------------------------------------------------------------
 # Gate 4: Real Compiled-Binary Runtime Proof (reusable driver)
@@ -121,12 +123,12 @@ else
   echo "  warn: terraform not installed; skipping terraform fmt -check"
 fi
 
-bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh
-echo "  ok: bash -n passed for verify.sh, drive.sh, and Packer runner scripts"
+bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh
+echo "  ok: bash -n passed for verify.sh, drive.sh, Packer, and Cloud Hypervisor scripts"
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh
-  echo "  ok: shellcheck passed for Packer runner scripts"
+  shellcheck infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh
+  echo "  ok: shellcheck passed for Packer and Cloud Hypervisor scripts"
 else
   echo "  warn: shellcheck not installed; skipping shellcheck"
 fi

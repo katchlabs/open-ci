@@ -9,6 +9,7 @@ This guide takes you from zero to ephemeral Spot/On-Demand GitHub Actions runner
 | **AWS-Only** | [`infra/terraform/examples/aws-controller`](../infra/terraform/examples/aws-controller/main.tf) | `aws-foundation`, `aws-controller` | Teams running natively on AWS EC2 (`t4g.small` controller + Spot/On-Demand runners + optional BYOC `AssumeRole`). |
 | **GCP-Only** | [`infra/terraform/examples/gcp-quickstart`](../infra/terraform/examples/gcp-quickstart/main.tf) | `gcp-foundation`, `gcp-controller` | Teams running on GCP Compute Engine with Spot VMs, native `maxRunDuration`, and Cloud NAT egress. |
 | **Multi-Cloud** | [`infra/terraform/examples/multi-cloud`](../infra/terraform/examples/multi-cloud/main.tf) | `gcp-foundation`, `gcp-controller`, `aws-foundation` | Spot-resilient fleets spilling automatically between GCP and AWS when a region or instance family stocks out. |
+| **Cloud Hypervisor** | [`infra/cloud-hypervisor`](../infra/cloud-hypervisor/setup-host.sh) | `setup-host.sh`, `build-rootfs.sh` | Dedicated bare-metal or nested-KVM Ubuntu 24.04 hosts running sub-second CoW microVMs (`config/open-ci.cloud-hypervisor.example.toml`). |
 
 ---
 
@@ -76,6 +77,18 @@ terraform apply \
 The multi-cloud example's GCP controller reaches AWS without access keys: it exchanges its Google identity token for the `aws_role_arn` output via STS `AssumeRoleWithWebIdentity`. Copy the `aws_role_arn` and `aws_web_identity_audience` outputs into `[aws]` in Step 3.
 
 After `terraform apply` completes, create a DNS `A` record pointing `ci.example.com` to the `controller_ip` output and note the printed subnet IDs, security group ID, and IAM/service account outputs.
+
+### Path D: Bare-Metal / Nested-KVM MicroVMs (`cloud_hypervisor`)
+
+On an Ubuntu 24.04 host with `/dev/kvm` (bare metal or nested KVM), prepare the host, build the rootfs/kernel, and validate [`config/open-ci.cloud-hypervisor.example.toml`](../config/open-ci.cloud-hypervisor.example.toml):
+
+```bash
+sudo ./infra/cloud-hypervisor/setup-host.sh
+sudo OPEN_CI_BIN=/usr/local/bin/open-ci ./infra/cloud-hypervisor/build-rootfs.sh
+open-ci validate --config config/open-ci.cloud-hypervisor.example.toml
+```
+
+> **Systemd note:** `deploy/systemd/open-ci.service` sandboxes devices and capabilities for cloud-only controllers. When running `cloud_hypervisor` locally, add a systemd drop-in (`/etc/systemd/system/open-ci.service.d/cloud-hypervisor.conf`) granting `PrivateDevices=no`, `DeviceAllow=/dev/kvm rw`, `DeviceAllow=/dev/net/tun rw`, `AmbientCapabilities=CAP_NET_ADMIN`, `CapabilityBoundingSet=CAP_NET_ADMIN`, and `ReadWritePaths=/var/lib/open-ci`.
 
 ---
 
@@ -319,6 +332,19 @@ OPEN_CI_OPERATOR_TOKEN="$(sudo cat /etc/open-ci/operator-token)" \
    ```bash
    open-ci ctl --url http://127.0.0.1:8080 status
    ```
+
+---
+
+## Performance & Spot Tuning
+
+For high-throughput CI fleets, start from [`config/open-ci.high-perf.example.toml`](../config/open-ci.high-perf.example.toml) (AWS + GCP Spot with local NVMe SSDs and warm idle capacity) or [`config/open-ci.cloud-hypervisor.example.toml`](../config/open-ci.cloud-hypervisor.example.toml):
+
+| Knob | Scope | Effect |
+| --- | --- | --- |
+| `cache.hot_cache_bytes` | `[cache]` | Bounded in-memory LRU tier in front of `[cache.storage]` (size to `<= 50%` of cache host RAM, e.g. `2147483648` for 2 GiB). |
+| `local_ssd_count`, `disk_type`, `disk_interface`, `nic_type`, `network_bandwidth_tier`, `threads_per_core` | GCP `[[pools.*.placements]]` | Attach local NVMe (`c4d-*-lssd` / `c4a-*-lssd`), `hyperdisk-balanced`, `GVNIC` + `TIER_1`, or `threads_per_core = 1` (1 physical core/vCPU). |
+| `core_count`, `threads_per_core`, `disk_type`, `ebs_iops`, `ebs_throughput_mbps`, `placement_group` | AWS `[[pools.*.placements]]` | Disable SMT on EC2 (`core_count` + `threads_per_core = 1`), choose `gp3`/`io2` IOPS/throughput, or pin a placement group. |
+| `OPEN_CI_NVME_PAGE_CACHE` | Runner VM env (`setup-nvme.sh`) | `auto` (default) enables XFS-backed 4K-sector page-cache acceleration on `>= 14 GiB` RAM VMs (sized to 85% of NVMe) and direct `ext4` on smaller VMs. |
 
 ---
 

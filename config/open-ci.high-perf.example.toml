@@ -1,0 +1,179 @@
+# High-performance multi-cloud Spot configuration (4-vCPU linux-x64 and linux-arm64
+# with local ephemeral NVMe SSDs, warm idle capacity, and RAM + local disk transparent cache).
+# Replace placeholder repository, project, account, image, subnet, and security group IDs before live use.
+
+repository = "example-org/example-repo"
+
+[server]
+listen = "127.0.0.1:8080"
+public_url = "https://open-ci.example.com"
+database_path = "/var/lib/open-ci/open-ci.db"
+tick_seconds = 2
+request_timeout_seconds = 20
+allow_insecure_loopback = false
+cors_allowed_origins = []
+
+[github]
+api_url = "https://api.github.com"
+oidc_issuer = "https://token.actions.githubusercontent.com"
+
+[gcp]
+project = "your-gcp-project-id"
+compute_url = "https://compute.googleapis.com/compute/v1"
+image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-x64-20260101-000000"
+external_ipv4 = false
+network_tier = "PREMIUM"
+network_tags = ["open-ci-runner"]
+
+[aws]
+account_id = "123456789012"
+
+[cache]
+listen = "0.0.0.0:8090"
+public_url = "http://10.0.0.5:8090"
+max_entry_bytes = 10737418240
+signed_url_ttl_seconds = 900
+# Optional in-memory hot tier in front of [cache.storage] (4 GiB here; size to <= 50% of host RAM).
+hot_cache_bytes = 4294967296
+# Matches deploy/systemd/open-ci-cache.service ReadWritePaths. Mount local NVMe at /var/lib/open-ci-cache for fastest I/O.
+index_path = "/var/lib/open-ci-cache/index.db"
+upstream_results_url = "https://results-receiver.actions.githubusercontent.com"
+
+[cache.auth]
+repositories = [123456789]
+
+[cache.storage]
+type = "local"
+path = "/var/lib/open-ci-cache/blobs"
+
+[cache.retention]
+max_total_bytes = 107374182400
+max_unused_days = 7
+sweep_interval_seconds = 300
+
+[admission]
+mode = "webhook"
+max_run_seconds = 3600
+fallback_on_rerun = true
+
+[admission.capacity]
+vcpu = 128
+instances = 32
+disk_gb = 1600
+
+[admission.background]
+vcpu = 4
+instances = 1
+disk_gb = 40
+
+[admission.guardrails]
+max_concurrent_runs = 8
+
+[pools.linux-x64]
+runner_label = "open-ci-linux-x64"
+fallback_label = "ubuntu-24.04"
+architecture = "x64"
+vcpu = 4
+disk_gb = 40
+max_instances = 8
+min_idle_instances = 1
+creates_per_tick = 4
+lifetime_seconds = 2400
+idle_seconds = 180
+job_poll_seconds = 5
+cloud_discovery_seconds = 30
+prefer_cheapest = false
+transparent_cache = true
+
+[pools.linux-x64.provider_weights]
+aws = 1
+gcp = 1
+
+[[pools.linux-x64.placements]]
+provider = "aws"
+region = "us-east-1"
+zone = "us-east-1a"
+machine_type = "c7ad.xlarge"
+subnet = "subnet-0123456789abcdef0"
+image = "ami-0123456789abcdef0"
+security_group = "sg-0123456789abcdef0"
+root_device = "/dev/sda1"
+spot = true
+# Optional hardware tuning:
+# core_count = 4
+# threads_per_core = 1
+# ebs_iops = 6000
+# ebs_throughput_mbps = 500
+# placement_group = "open-ci-cluster"
+
+[[pools.linux-x64.placements]]
+provider = "aws"
+region = "us-east-1"
+zone = "us-east-1b"
+machine_type = "c8a.xlarge"
+subnet = "subnet-0123456789abcdef1"
+image = "ami-0123456789abcdef0"
+security_group = "sg-0123456789abcdef0"
+root_device = "/dev/sda1"
+spot = true
+
+[[pools.linux-x64.placements]]
+provider = "gcp"
+region = "us-central1"
+zone = "us-central1-a"
+machine_type = "c4d-standard-4-lssd"
+subnet = "projects/your-gcp-project-id/regions/us-central1/subnetworks/open-ci"
+image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-x64-20260101-000000"
+disk_type = "hyperdisk-balanced"
+disk_interface = "NVME"
+nic_type = "GVNIC"
+local_ssd_count = 1
+network_bandwidth_tier = "TIER_1"
+# Optional: disable SMT for 1 physical core per vCPU (pair with an 8-vCPU shape for 4 physical cores).
+# threads_per_core = 1
+spot = true
+
+[pools.linux-arm64]
+runner_label = "open-ci-linux-arm64"
+fallback_label = "ubuntu-24.04-arm"
+architecture = "arm64"
+vcpu = 4
+disk_gb = 40
+max_instances = 8
+min_idle_instances = 1
+creates_per_tick = 4
+lifetime_seconds = 2400
+idle_seconds = 180
+job_poll_seconds = 5
+cloud_discovery_seconds = 30
+prefer_cheapest = false
+transparent_cache = true
+
+[pools.linux-arm64.provider_weights]
+aws = 1
+gcp = 1
+
+[[pools.linux-arm64.placements]]
+provider = "aws"
+region = "us-east-1"
+zone = "us-east-1a"
+machine_type = "c8gd.xlarge"
+subnet = "subnet-0123456789abcdef0"
+image = "ami-0fedcba9876543210"
+security_group = "sg-0123456789abcdef0"
+root_device = "/dev/sda1"
+spot = true
+
+[[pools.linux-arm64.placements]]
+provider = "gcp"
+region = "us-central1"
+zone = "us-central1-a"
+machine_type = "c4a-standard-4-lssd"
+subnet = "projects/your-gcp-project-id/regions/us-central1/subnetworks/open-ci"
+image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-arm64-20260101-000000"
+disk_type = "hyperdisk-balanced"
+disk_interface = "NVME"
+nic_type = "GVNIC"
+local_ssd_count = 1
+network_bandwidth_tier = "TIER_1"
+spot = true

@@ -63,6 +63,7 @@ account_id = "123456789012"
 # Pools opt in with `transparent_cache = true` (not for pools running `container:` jobs or Docker actions).
 # [cache]
 # public_url = "http://10.0.0.5:8090"          # Private address runner subnets reach the cache on
+# hot_cache_bytes = 2147483648                 # Optional in-memory LRU hot tier (e.g. 2 GiB)
 # [cache.auth]
 # repositories = [123456789]                     # Numeric repository IDs (gh api repos/OWNER/REPO --jq .id), or "any"
 # [cache.storage]                                # Defaults to type = "local", path = "/var/lib/open-ci-cache/blobs"

@@ -1,0 +1,103 @@
+# Cloud Hypervisor microVM configuration for bare-metal or nested-KVM Ubuntu 24.04 hosts.
+# Pairs XFS reflink CoW rootfs clones with a RAM-accelerated local transparent v2 cache.
+# Run infra/cloud-hypervisor/setup-host.sh and build-rootfs.sh first, then replace placeholders below.
+
+repository = "example-org/example-repo"
+
+[server]
+listen = "127.0.0.1:8080"
+public_url = "https://open-ci.example.com"
+database_path = "/var/lib/open-ci/open-ci.db"
+tick_seconds = 1
+request_timeout_seconds = 20
+allow_insecure_loopback = false
+cors_allowed_origins = []
+
+[github]
+api_url = "https://api.github.com"
+oidc_issuer = "https://token.actions.githubusercontent.com"
+
+[cloud_hypervisor]
+binary = "/usr/local/bin/cloud-hypervisor"
+state_dir = "/var/lib/open-ci/microvms"
+kernel_path = "/var/lib/open-ci/images/vmlinux"
+rootfs_image = "/var/lib/open-ci/images/ubuntu-24.04-rootfs.ext4"
+kernel_cmdline = "console=ttyS0 root=/dev/vda rw rootfstype=ext4 rootflags=nobarrier,noblock_validity,noinit_itable quiet"
+bridge_name = "open-ci-br0"
+subnet_cidr = "10.200.0.0/16"
+host_direct_io = false
+virtio_blk_queues = 4
+# Set to true only after reserving 2 MiB hugepages via HUGEPAGES_GB in setup-host.sh.
+memory_hugepages = false
+# Set to true on dedicated bare-metal hosts to pin each microVM to disjoint physical CPU cores.
+pin_physical_cpus = false
+default_vcpus = 4
+default_memory_mib = 16384
+
+[cache]
+listen = "10.200.0.1:8090"
+public_url = "http://10.200.0.1:8090"
+max_entry_bytes = 10737418240
+signed_url_ttl_seconds = 900
+# 2 GiB in-memory hot tier; raise on high-RAM hosts (e.g. 8589934592 for 8 GiB).
+hot_cache_bytes = 2147483648
+index_path = "/var/lib/open-ci/cache/index.db"
+upstream_results_url = "https://results-receiver.actions.githubusercontent.com"
+
+[cache.auth]
+repositories = [123456789]
+
+[cache.storage]
+type = "local"
+path = "/var/lib/open-ci/cache/blobs"
+
+[cache.retention]
+max_total_bytes = 107374182400
+max_unused_days = 7
+sweep_interval_seconds = 300
+
+[admission]
+mode = "webhook"
+max_run_seconds = 3600
+fallback_on_rerun = true
+
+[admission.capacity]
+vcpu = 64
+instances = 16
+disk_gb = 1024
+
+[admission.background]
+vcpu = 4
+instances = 1
+disk_gb = 64
+
+[admission.guardrails]
+max_concurrent_runs = 8
+
+[pools.linux-x64]
+runner_label = "open-ci-linux-x64"
+fallback_label = "ubuntu-24.04"
+architecture = "x64"
+vcpu = 4
+disk_gb = 64
+max_instances = 8
+min_idle_instances = 1
+creates_per_tick = 4
+lifetime_seconds = 2400
+idle_seconds = 180
+job_poll_seconds = 5
+cloud_discovery_seconds = 30
+prefer_cheapest = false
+transparent_cache = true
+
+[pools.linux-x64.provider_weights]
+cloud_hypervisor = 1
+
+[[pools.linux-x64.placements]]
+provider = "cloud_hypervisor"
+region = "local"
+zone = "local-a"
+# Machine type syntax: ch-<vcpus>c-<ram_gb>g (or ch-<vcpus>c-<ram_mib>m).
+machine_type = "ch-4c-16g"
+subnet = "open-ci-br0"
+spot = false
