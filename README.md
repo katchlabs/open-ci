@@ -239,7 +239,7 @@ Ready for AWS, GCP, or multi-cloud failover? Turnkey modules and release artifac
 - **Prebuilt binaries & AWS janitor Lambda zips:** [`github.com/katchlabs/open-ci/releases/latest`](https://github.com/katchlabs/open-ci/releases/latest) (`x86_64` & `aarch64` Linux)
 - **Terraform modules (`infra/terraform`):** [`aws-controller`](infra/terraform/examples/aws-controller/main.tf), [`gcp-quickstart`](infra/terraform/examples/gcp-quickstart/main.tf), and [`multi-cloud`](infra/terraform/examples/multi-cloud/main.tf) (with keyless GCP→AWS web identity federation)
 - **Packer runner images (`infra/packer`):** Unified Ubuntu 24.04 `x64`/`arm64` template with pinned `actions/runner`, Docker BuildKit, sysctl tuning, and boot-time auto-NVMe RAID0
-- **Step-by-step guide:** Follow the [**Deployment Quickstart**](docs/quickstart.md)
+- **Step-by-step or 1-command install:** Run [`deploy/install.sh`](deploy/install.sh) (or `open-ci init` interactively) or follow the [**Deployment Quickstart**](docs/quickstart.md)
 
 ---
 

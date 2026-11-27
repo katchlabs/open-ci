@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, ValueEnum};
 use open_ci_core::OpenCiConfig;
 use std::fmt::Write as _;
+use std::io::{BufRead, IsTerminal, Write as IoWrite};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -73,46 +74,167 @@ pub struct InitArgs {
 }
 
 pub fn run_init(args: &InitArgs) -> Result<()> {
-    let rendered = render_init_config(args)?;
-    let to_stdout = args.output.as_os_str() == "-";
+    let resolved = if args.repo.is_none()
+        && args.org.is_none()
+        && args.output.as_os_str() != "-"
+        && std::io::stdin().is_terminal()
+    {
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        let mut stderr = std::io::stderr();
+        prompt_args_from_reader(args, &mut reader, &mut stderr)?
+    } else {
+        args.clone()
+    };
+
+    let rendered = render_init_config(&resolved)?;
+    let to_stdout = resolved.output.as_os_str() == "-";
     if to_stdout {
         print!("{rendered}");
         return Ok(());
     }
 
-    if args.output.exists() && !args.force {
+    if resolved.output.exists() && !resolved.force {
         bail!(
             "{} already exists (pass --force to overwrite or --output - for stdout)",
-            args.output.display()
+            resolved.output.display()
         );
     }
-    if let Some(parent) = args.output.parent()
+    if let Some(parent) = resolved.output.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating {}", parent.display()))?;
     }
-    std::fs::write(&args.output, &rendered)
-        .with_context(|| format!("failed writing {}", args.output.display()))?;
+    std::fs::write(&resolved.output, &rendered)
+        .with_context(|| format!("failed writing {}", resolved.output.display()))?;
 
-    let serve_flag = if args.with_cache { " --with-cache" } else { "" };
-    println!("Wrote validated config to {}", args.output.display());
+    let serve_flag = if resolved.with_cache {
+        " --with-cache"
+    } else {
+        ""
+    };
+    println!("Wrote validated config to {}", resolved.output.display());
     println!();
     println!("Next steps:");
     println!(
         "  1. Replace placeholder subnet/image IDs in {}",
-        args.output.display()
+        resolved.output.display()
     );
     println!(
         "  2. Run preflight checks:  open-ci doctor --config {}{serve_flag}",
-        args.output.display()
+        resolved.output.display()
     );
     println!(
         "  3. Start open-ci:         open-ci serve --config {}{serve_flag}",
-        args.output.display()
+        resolved.output.display()
     );
     println!("  4. Use in GitHub Actions: runs-on: open-ci-linux-x64");
     Ok(())
+}
+
+fn prompt_line<R: BufRead, W: IoWrite>(
+    reader: &mut R,
+    writer: &mut W,
+    prompt: &str,
+    default: &str,
+) -> Result<String> {
+    write!(writer, "{prompt} [{default}]: ")?;
+    writer.flush()?;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        Ok(default.to_owned())
+    } else {
+        Ok(trimmed.to_owned())
+    }
+}
+
+fn parse_preset_name(input: &str) -> Result<InitPreset> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "gcp-spot" | "gcp" => Ok(InitPreset::GcpSpot),
+        "aws-spot" | "aws" => Ok(InitPreset::AwsSpot),
+        "multi-cloud" | "multicloud" => Ok(InitPreset::MultiCloud),
+        "bare-metal" | "baremetal" | "ch" => Ok(InitPreset::BareMetal),
+        "hybrid" => Ok(InitPreset::Hybrid),
+        other => bail!(
+            "unknown preset `{other}` (choose gcp-spot, aws-spot, multi-cloud, bare-metal, or hybrid)"
+        ),
+    }
+}
+
+/// Interactive prompt helper for bare `open-ci init` on a terminal.
+pub fn prompt_args_from_reader<R: BufRead, W: IoWrite>(
+    base: &InitArgs,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<InitArgs> {
+    let mut args = base.clone();
+    writeln!(
+        writer,
+        "open-ci interactive setup (press Enter for defaults)"
+    )?;
+
+    let preset_raw = prompt_line(
+        reader,
+        writer,
+        "Preset (gcp-spot / aws-spot / multi-cloud / bare-metal / hybrid)",
+        "gcp-spot",
+    )?;
+    args.preset = parse_preset_name(&preset_raw)?;
+
+    let scope = prompt_line(
+        reader,
+        writer,
+        "GitHub repo (`owner/repo`) or org (`owner`)",
+        "example-org/example-repo",
+    )?;
+    if scope.contains('/') {
+        args.repo = Some(scope);
+        args.org = None;
+    } else {
+        args.repo = None;
+        args.org = Some(scope);
+    }
+
+    args.public_url = prompt_line(
+        reader,
+        writer,
+        "Controller public HTTPS URL",
+        &args.public_url,
+    )?;
+
+    if matches!(
+        args.preset,
+        InitPreset::GcpSpot | InitPreset::MultiCloud | InitPreset::Hybrid
+    ) {
+        args.gcp_project = prompt_line(reader, writer, "GCP project ID", &args.gcp_project)?;
+    }
+    if matches!(args.preset, InitPreset::AwsSpot | InitPreset::MultiCloud) {
+        args.aws_account =
+            prompt_line(reader, writer, "12-digit AWS account ID", &args.aws_account)?;
+    }
+
+    let cache_ans = prompt_line(
+        reader,
+        writer,
+        "Enable built-in transparent Actions v2 cache? (y/n)",
+        if args.with_cache { "y" } else { "n" },
+    )?;
+    args.with_cache = matches!(cache_ans.to_ascii_lowercase().as_str(), "y" | "yes");
+
+    if args.preset != InitPreset::BareMetal {
+        let arm_ans = prompt_line(
+            reader,
+            writer,
+            "Include ARM64 runner pool? (y/n)",
+            if args.arm64 { "y" } else { "n" },
+        )?;
+        args.arm64 = matches!(arm_ans.to_ascii_lowercase().as_str(), "y" | "yes");
+    }
+
+    Ok(args)
 }
 
 /// Renders and validates a complete `open-ci.toml` for the requested preset.
@@ -544,5 +666,26 @@ mod tests {
         let mut both = base_args(InitPreset::AwsSpot);
         both.org = Some("acme".to_owned());
         assert!(render_init_config(&both).is_err());
+    }
+
+    #[test]
+    fn interactive_wizard_produces_validated_hybrid_config() {
+        let input = b"hybrid\nacme\nhttps://ci.acme.dev\nacme-prod\ny\ny\n";
+        let mut reader = std::io::Cursor::new(&input[..]);
+        let mut sink = Vec::new();
+        let base = InitArgs {
+            repo: None,
+            ..base_args(InitPreset::GcpSpot)
+        };
+        let prompted = prompt_args_from_reader(&base, &mut reader, &mut sink);
+        assert!(prompted.is_ok());
+        if let Ok(args) = prompted {
+            assert_eq!(args.preset, InitPreset::Hybrid);
+            assert_eq!(args.org.as_deref(), Some("acme"));
+            assert!(args.repo.is_none());
+            assert!(args.with_cache);
+            assert!(args.arm64);
+            assert!(render_init_config(&args).is_ok());
+        }
     }
 }
