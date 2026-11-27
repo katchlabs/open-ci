@@ -145,6 +145,13 @@ packer build \
 
 ## Step 3: Configure `open-ci.toml`, Secrets & Credential Broker
 
+> **Fast path (1-command controller install):** Run [`deploy/install.sh`](../deploy/install.sh) on Ubuntu/Debian to download the SHA-256-verified release binary, create system users and `0600` secrets, generate a validated `/etc/open-ci/open-ci.toml`, and install hardened systemd units in one step:
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/katchlabs/open-ci/main/deploy/install.sh \
+>   | sudo bash -s -- --preset gcp-spot --repo my-org/my-repo --gcp-project YOUR_GCP_PROJECT --domain ci.example.com --with-cache
+> ```
+> Or run `open-ci init` interactively on any terminal to walk through presets (`gcp-spot`, `aws-spot`, `multi-cloud`, `bare-metal`, `hybrid`). Manual step-by-step setup follows below.
+
 On the controller host (AWS: connect with `$(terraform output -raw ssm_session_command)`), install the binary to `/usr/local/bin/open-ci` and create dedicated system users (`open-ci` for the control plane and cache; `open-ci-broker` in group `open-ci` for credential rotation):
 
 ```bash
