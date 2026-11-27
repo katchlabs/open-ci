@@ -1,30 +1,58 @@
-//! Local filesystem / `NVMe` blob store with atomic `0o600` writes.
+//! Local filesystem / `NVMe` blob store with atomic `0o600` writes and zero-copy chunked manifests.
 
 use crate::error::CacheError;
 use crate::ids::{BlobId, BlockId, ByteRange};
 use crate::storage::{BlobStore, BlobUpload, ByteStream};
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use bytes::BytesMut;
+use futures_util::{StreamExt, stream};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
-const READ_CHUNK_BYTES: usize = 256 * 1024;
+const READ_CHUNK_BYTES: usize = 512 * 1024;
+const WRITE_BUFFER_BYTES: usize = 512 * 1024;
 
-/// Blob store rooted at a local directory: `blobs/<id>`, `staging/<id>/<block>`, `tmp/`.
+/// Blob store rooted at a local directory: `blobs/<id>`, `committed/<id>/<block>`,
+/// `staging/<id>/<block>`, `tmp/`.
 #[derive(Debug)]
 pub struct LocalBlobStore {
     root: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Manifest {
+    total_size: u64,
+    parts: Vec<ManifestPart>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestPart {
+    file: String,
+    size: u64,
+}
+
+struct OpenPartSlice {
+    file: File,
+    len: u64,
+}
+
+struct MultiPartReader {
+    slices: VecDeque<OpenPartSlice>,
+    current: Option<(File, u64)>,
+    buf: BytesMut,
 }
 
 impl LocalBlobStore {
     pub async fn open(root: impl Into<PathBuf>) -> Result<Self, CacheError> {
         let root = root.into();
         remove_dir_if_exists(&root.join("tmp")).await?;
-        for dir in ["blobs", "staging", "tmp"] {
+        for dir in ["blobs", "committed", "staging", "tmp"] {
             fs::create_dir_all(root.join(dir))
                 .await
                 .map_err(|err| storage_error(&format!("creating {dir} directory"), &err))?;
@@ -34,6 +62,16 @@ impl LocalBlobStore {
 
     fn blob_path(&self, blob: &BlobId) -> PathBuf {
         self.root.join("blobs").join(blob.as_str())
+    }
+
+    fn manifest_path(&self, blob: &BlobId) -> PathBuf {
+        self.root
+            .join("blobs")
+            .join(format!("{}.manifest", blob.as_str()))
+    }
+
+    fn committed_dir(&self, blob: &BlobId) -> PathBuf {
+        self.root.join("committed").join(blob.as_str())
     }
 
     fn staging_dir(&self, blob: &BlobId) -> PathBuf {
@@ -60,27 +98,71 @@ impl LocalBlobStore {
         temp.persist(dest).await
     }
 
-    async fn staged_sizes(
+    async fn staged_parts(
         &self,
         blob: &BlobId,
         blocks: &[BlockId],
-    ) -> Result<Vec<(PathBuf, u64)>, CacheError> {
-        let mut sizes = Vec::with_capacity(blocks.len());
+    ) -> Result<Vec<ManifestPart>, CacheError> {
+        let staging_dir = self.staging_dir(blob);
+        let mut parts = Vec::with_capacity(blocks.len());
         for block in blocks {
-            let path = self.block_path(blob, block);
+            let file = block.storage_name();
+            let path = staging_dir.join(&file);
             let size = file_size(&path).await?.ok_or_else(|| {
                 CacheError::BadRequest(format!("staged block not found: {}", block.as_str()))
             })?;
-            sizes.push((path, size));
+            parts.push(ManifestPart { file, size });
         }
-        Ok(sizes)
+        Ok(parts)
+    }
+
+    async fn read_manifest(&self, blob: &BlobId) -> Result<Option<Manifest>, CacheError> {
+        match fs::read(self.manifest_path(blob)).await {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(manifest) => Ok(Some(manifest)),
+                Err(err) => {
+                    tracing::warn!(blob = %blob, error = %err, "ignoring corrupt cache manifest");
+                    Ok(None)
+                }
+            },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(storage_error("reading manifest", &err)),
+        }
+    }
+
+    async fn already_committed_size(
+        &self,
+        blob: &BlobId,
+        blocks: &[BlockId],
+        max_size: u64,
+    ) -> Result<Option<u64>, CacheError> {
+        if let Some(manifest) = self.read_manifest(blob).await? {
+            let names_match = manifest.parts.len() == blocks.len()
+                && manifest
+                    .parts
+                    .iter()
+                    .zip(blocks)
+                    .all(|(part, id)| part.file == id.storage_name());
+            if names_match && manifest.total_size <= max_size {
+                return Ok(Some(manifest.total_size));
+            }
+        }
+        if blocks.len() == 1
+            && let Some(size) = file_size(&self.blob_path(blob)).await?
+            && size <= max_size
+        {
+            return Ok(Some(size));
+        }
+        Ok(None)
     }
 }
 
 #[async_trait]
 impl BlobStore for LocalBlobStore {
     async fn put(&self, blob: &BlobId, upload: BlobUpload) -> Result<(), CacheError> {
-        self.write_atomically(&self.blob_path(blob), upload).await
+        self.write_atomically(&self.blob_path(blob), upload).await?;
+        remove_if_exists(&self.manifest_path(blob)).await?;
+        remove_dir_if_exists(&self.committed_dir(blob)).await
     }
 
     async fn stage_block(
@@ -107,44 +189,177 @@ impl BlobStore for LocalBlobStore {
                 "block list must not be empty".to_owned(),
             ));
         }
-        let staged = self.staged_sizes(blob, blocks).await?;
-        let total = staged
+        let parts = match self.staged_parts(blob, blocks).await {
+            Ok(parts) => parts,
+            Err(err) => {
+                if let Some(total) = self.already_committed_size(blob, blocks, max_size).await? {
+                    return Ok(total);
+                }
+                return Err(err);
+            }
+        };
+        let total = parts
             .iter()
-            .try_fold(0u64, |acc, (_, size)| acc.checked_add(*size))
+            .try_fold(0u64, |acc, part| acc.checked_add(part.size))
             .filter(|total| *total <= max_size)
             .ok_or_else(|| {
                 CacheError::PayloadTooLarge(format!("joined blob exceeds {max_size} bytes"))
             })?;
 
+        if let [only] = parts.as_slice() {
+            let staged_file = self.staging_dir(blob).join(&only.file);
+            fs::rename(&staged_file, self.blob_path(blob))
+                .await
+                .map_err(|err| storage_error("committing single block", &err))?;
+            remove_if_exists(&self.manifest_path(blob)).await?;
+            remove_dir_if_exists(&self.committed_dir(blob)).await?;
+            remove_dir_if_exists(&self.staging_dir(blob)).await?;
+            return Ok(total);
+        }
+
+        let committed = self.committed_dir(blob);
+        remove_if_exists(&self.manifest_path(blob)).await?;
+        remove_if_exists(&self.blob_path(blob)).await?;
+        remove_dir_if_exists(&committed).await?;
+        fs::rename(self.staging_dir(blob), &committed)
+            .await
+            .map_err(|err| storage_error("moving staged blocks", &err))?;
+        let keep: HashSet<&str> = parts.iter().map(|part| part.file.as_str()).collect();
+        prune_unreferenced_files(&committed, &keep).await?;
+
+        let manifest_bytes = serde_json::to_vec(&Manifest {
+            total_size: total,
+            parts,
+        })
+        .map_err(|err| CacheError::Internal(format!("encoding manifest: {err}")))?;
         let temp = self.temp_file();
-        concatenate(&temp.path, &staged).await?;
-        temp.persist(&self.blob_path(blob)).await?;
-        remove_dir_if_exists(&self.staging_dir(blob)).await?;
+        write_bytes(&temp.path, &manifest_bytes).await?;
+        temp.persist(&self.manifest_path(blob)).await?;
         Ok(total)
     }
 
     async fn size(&self, blob: &BlobId) -> Result<Option<u64>, CacheError> {
-        file_size(&self.blob_path(blob)).await
+        if let Some(size) = file_size(&self.blob_path(blob)).await? {
+            return Ok(Some(size));
+        }
+        Ok(self
+            .read_manifest(blob)
+            .await?
+            .map(|manifest| manifest.total_size))
     }
 
     async fn read(&self, blob: &BlobId, range: ByteRange) -> Result<ByteStream, CacheError> {
-        let mut file = match File::open(self.blob_path(blob)).await {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Err(CacheError::NotFound("blob not found".to_owned()));
+        match File::open(self.blob_path(blob)).await {
+            Ok(mut file) => {
+                file.seek(SeekFrom::Start(range.start()))
+                    .await
+                    .map_err(|err| storage_error("seeking blob", &err))?;
+                return Ok(ReaderStream::with_capacity(
+                    file.take(range.byte_count()),
+                    READ_CHUNK_BYTES,
+                )
+                .boxed());
             }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(storage_error("opening blob", &err)),
-        };
-        file.seek(SeekFrom::Start(range.start()))
-            .await
-            .map_err(|err| storage_error("seeking blob", &err))?;
-        Ok(ReaderStream::with_capacity(file.take(range.byte_count()), READ_CHUNK_BYTES).boxed())
+        }
+
+        let manifest = self
+            .read_manifest(blob)
+            .await?
+            .ok_or_else(|| CacheError::NotFound("blob not found".to_owned()))?;
+        let slices = open_part_slices(&self.committed_dir(blob), &manifest.parts, range).await?;
+        Ok(stream_part_slices(slices))
     }
 
     async fn delete(&self, blob: &BlobId) -> Result<(), CacheError> {
         remove_if_exists(&self.blob_path(blob)).await?;
+        remove_if_exists(&self.manifest_path(blob)).await?;
+        remove_dir_if_exists(&self.committed_dir(blob)).await?;
         remove_dir_if_exists(&self.staging_dir(blob)).await
     }
+}
+
+async fn open_part_slices(
+    committed_dir: &Path,
+    parts: &[ManifestPart],
+    range: ByteRange,
+) -> Result<VecDeque<OpenPartSlice>, CacheError> {
+    let mut slices = VecDeque::new();
+    let mut cursor = 0u64;
+    for part in parts {
+        if part.size == 0 {
+            continue;
+        }
+        let part_start = cursor;
+        let part_end_inclusive = cursor.saturating_add(part.size - 1);
+        cursor = cursor.saturating_add(part.size);
+        if part_end_inclusive < range.start() {
+            continue;
+        }
+        if part_start > range.end_inclusive() {
+            break;
+        }
+        let slice_start = range.start().max(part_start);
+        let slice_end_inclusive = range.end_inclusive().min(part_end_inclusive);
+        let offset = slice_start - part_start;
+        let len = (slice_end_inclusive - slice_start) + 1;
+        let mut file = File::open(committed_dir.join(&part.file))
+            .await
+            .map_err(|err| {
+                if err.kind() == io::ErrorKind::NotFound {
+                    CacheError::NotFound("committed cache block missing".to_owned())
+                } else {
+                    storage_error("opening committed block", &err)
+                }
+            })?;
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset))
+                .await
+                .map_err(|err| storage_error("seeking committed block", &err))?;
+        }
+        slices.push_back(OpenPartSlice { file, len });
+    }
+    Ok(slices)
+}
+
+fn stream_part_slices(slices: VecDeque<OpenPartSlice>) -> ByteStream {
+    let state = MultiPartReader {
+        slices,
+        current: None,
+        buf: BytesMut::new(),
+    };
+    stream::try_unfold(state, |mut state| async move {
+        loop {
+            if let Some((file, remaining)) = state.current.as_mut() {
+                if *remaining == 0 {
+                    state.current = None;
+                    continue;
+                }
+                let to_read = usize::try_from((*remaining).min(READ_CHUNK_BYTES as u64))
+                    .unwrap_or(READ_CHUNK_BYTES);
+                if state.buf.capacity() < to_read {
+                    state.buf = BytesMut::with_capacity(to_read);
+                }
+                let limit = to_read as u64;
+                let read = file.take(limit).read_buf(&mut state.buf).await?;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "committed cache block truncated",
+                    ));
+                }
+                *remaining -= read as u64;
+                let chunk = state.buf.split().freeze();
+                return Ok(Some((chunk, state)));
+            }
+            let Some(next) = state.slices.pop_front() else {
+                return Ok(None);
+            };
+            state.current = Some((next.file, next.len));
+        }
+    })
+    .boxed()
 }
 
 /// Temporary file removed on drop unless persisted, so cancelled uploads leave nothing behind.
@@ -175,31 +390,49 @@ impl Drop for TempFile {
 }
 
 async fn write_stream(path: &Path, mut body: ByteStream) -> Result<(), CacheError> {
-    let mut file = create_private_file(path).await?;
+    let file = create_private_file(path).await?;
+    let mut writer = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|err| CacheError::BadRequest(err.to_string()))?;
-        file.write_all(&chunk)
+        writer
+            .write_all(&chunk)
             .await
             .map_err(|err| storage_error("writing blob", &err))?;
     }
-    file.sync_all()
+    writer
+        .flush()
         .await
-        .map_err(|err| storage_error("syncing blob", &err))
+        .map_err(|err| storage_error("flushing blob", &err))
 }
 
-async fn concatenate(dest: &Path, parts: &[(PathBuf, u64)]) -> Result<(), CacheError> {
-    let mut out = create_private_file(dest).await?;
-    for (path, _) in parts {
-        let mut part = File::open(path)
-            .await
-            .map_err(|err| storage_error("opening staged block", &err))?;
-        tokio::io::copy(&mut part, &mut out)
-            .await
-            .map_err(|err| storage_error("joining staged blocks", &err))?;
-    }
-    out.sync_all()
+async fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
+    let mut file = create_private_file(path).await?;
+    file.write_all(bytes)
         .await
-        .map_err(|err| storage_error("syncing joined blob", &err))
+        .map_err(|err| storage_error("writing manifest", &err))?;
+    file.sync_all()
+        .await
+        .map_err(|err| storage_error("syncing manifest", &err))
+}
+
+async fn prune_unreferenced_files(dir: &Path, keep: &HashSet<&str>) -> Result<(), CacheError> {
+    let mut entries = fs::read_dir(dir)
+        .await
+        .map_err(|err| storage_error("listing committed blocks", &err))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|err| storage_error("reading committed directory", &err))?
+    {
+        let kept = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| keep.contains(name));
+        if !kept {
+            remove_if_exists(&entry.path()).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn create_private_file(path: &Path) -> Result<File, CacheError> {

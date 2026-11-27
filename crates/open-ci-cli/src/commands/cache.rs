@@ -3,8 +3,8 @@
 use crate::commands::serve::{read_optional_secret_file, wait_for_shutdown_signal};
 use anyhow::{Context, Result, anyhow};
 use open_ci_cache::{
-    BlobStore, CacheConfig, CacheIndex, CacheServer, GcsBlobStore, GcsStoreConfig, LocalBlobStore,
-    RetentionPolicy, S3BlobStore, S3StoreConfig,
+    BlobStore, CacheConfig, CacheIndex, CacheServer, GcsBlobStore, GcsStoreConfig,
+    HotMemoryBlobStore, LocalBlobStore, RetentionPolicy, S3BlobStore, S3StoreConfig,
 };
 use open_ci_core::config::{
     AwsCredentialsConfig, CacheServiceConfig, CacheStorageConfig, DEFAULT_GCS_ENDPOINT,
@@ -45,7 +45,10 @@ pub async fn run_cache(cfg: &OpenCiConfig) -> Result<()> {
         .build()
         .context("failed building HTTP client")?;
 
-    let store = build_store(&cache.storage, &http).await?;
+    let mut store = build_store(&cache.storage, &http).await?;
+    if cache.hot_cache_bytes > 0 {
+        store = Arc::new(HotMemoryBlobStore::new(store, cache.hot_cache_bytes));
+    }
     let index = CacheIndex::open(Path::new(&cache.index_path))
         .await
         .context("failed opening cache index")?;

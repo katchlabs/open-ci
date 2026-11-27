@@ -7,10 +7,14 @@ use tokio_util::sync::CancellationToken;
 
 /// Evicts per the retention policy and deletes the evicted blobs; returns the eviction count.
 pub(crate) async fn sweep(state: &CacheState) -> Result<usize, CacheError> {
-    let swept = state
-        .index
-        .sweep(state.clock.now_unix(), state.config.retention)
-        .await?;
+    let now = state.clock.now_unix();
+    let swept = state.index.sweep(now, state.config.retention).await?;
+    if let Ok(mut active) = state.active_reservations.write() {
+        for blob in &swept.blobs {
+            active.remove(blob);
+        }
+        active.retain(|_, stale_after| *stale_after > now);
+    }
     for blob in &swept.blobs {
         if let Err(err) = state.store.delete(blob).await {
             tracing::warn!(blob = %blob, error = %err, "evicted cache blob could not be deleted");
