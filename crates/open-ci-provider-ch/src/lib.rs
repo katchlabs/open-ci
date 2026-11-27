@@ -9,7 +9,8 @@ pub use api::{
 };
 pub use vm::{
     MAX_IFNAMSIZ, SEED_MAGIC, SEED_SECTOR_SIZE, VmMetadata, VmNetSlot, allocate_slot,
-    build_kernel_cmdline, decode_seed_image, encode_seed_image, parse_machine_shape,
+    allocate_slot_bounded, build_kernel_cmdline, decode_seed_image, encode_seed_image,
+    parse_machine_shape,
 };
 
 use async_trait::async_trait;
@@ -174,9 +175,13 @@ impl CloudHypervisorProvider {
         }
 
         let subnet = self.config.subnet_cidr.clone();
-        let slot = tokio::task::spawn_blocking(move || allocate_slot(&state_dir, &subnet))
-            .await
-            .map_err(|_| ProviderError::Transient("slot allocation task failed".to_owned()))??;
+        let max_instances = self.config.max_instances;
+        let zone = spec.placement.zone.clone();
+        let slot = tokio::task::spawn_blocking(move || {
+            allocate_slot_bounded(&state_dir, &subnet, max_instances, &zone)
+        })
+        .await
+        .map_err(|_| ProviderError::Transient("slot allocation task failed".to_owned()))??;
 
         let dir_to_create = vm_dir.clone();
         tokio::task::spawn_blocking(move || create_private_dir(&dir_to_create))

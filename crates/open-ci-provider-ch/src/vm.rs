@@ -175,8 +175,26 @@ pub fn write_seed_image(path: &Path, user_data: &str) -> Result<(), ProviderErro
 ///
 /// The gateway occupies base `.0.1`; guest VMs are allocated from `.0.2` through `.254.254`.
 pub fn allocate_slot(state_dir: &Path, subnet_cidr: &str) -> Result<VmNetSlot, ProviderError> {
+    allocate_slot_bounded(state_dir, subnet_cidr, None, "local")
+}
+
+/// Allocates a slot like [`allocate_slot`], returning [`ProviderError::CapacityUnavailable`]
+/// once active microVM count reaches `max_instances` so hybrid pools spill onto cloud Spot.
+pub fn allocate_slot_bounded(
+    state_dir: &Path,
+    subnet_cidr: &str,
+    max_instances: Option<usize>,
+    zone: &str,
+) -> Result<VmNetSlot, ProviderError> {
     let (network, mask, prefix_len) = parse_subnet_cidr(subnet_cidr)?;
     let existing = list_metadata(state_dir)?;
+    if let Some(limit) = max_instances
+        && existing.len() >= limit
+    {
+        return Err(ProviderError::CapacityUnavailable {
+            zone: zone.to_owned(),
+        });
+    }
 
     let mut used_ips = BTreeSet::new();
     let mut used_macs = BTreeSet::new();
