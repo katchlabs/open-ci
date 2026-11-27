@@ -187,7 +187,16 @@ OPEN_CI_CACHE_SIGNING_KEY_FILE=/etc/open-ci/cache-signing-key
 
 ### 3.2 Write `/etc/open-ci/open-ci.toml`
 
-Start from [`config/open-ci.example.toml`](../config/open-ci.example.toml). Key choices:
+Generate a validated config in one command with `open-ci init` (presets: `gcp-spot`, `aws-spot`, `multi-cloud`, `bare-metal`, `hybrid`), or start from [`config/open-ci.example.toml`](../config/open-ci.example.toml):
+
+```bash
+open-ci init --preset gcp-spot --repo my-org/my-repo --gcp-project YOUR_GCP_PROJECT --public-url https://ci.example.com --with-cache --arm64 -o /etc/open-ci/open-ci.toml
+open-ci doctor --config /etc/open-ci/open-ci.toml --with-cache
+```
+
+For single-VM deployments you can also run the control plane and transparent cache in one process via `open-ci serve --config /etc/open-ci/open-ci.toml --with-cache` (or keep them as separate systemd units as shown in Step 4).
+
+Key choices:
 
 - **Scope:** Set `repository = "my-org/my-repo"` for one repo, OR org-wide:
   ```toml
