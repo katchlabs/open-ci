@@ -37,6 +37,21 @@ pub struct OidcClaims {
     pub workflow_ref: String,
 }
 
+/// Cryptographically verified GitHub Actions OIDC token prior to tenant policy checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedOidcToken {
+    pub repository: String,
+    pub repository_id: u64,
+    pub owner_id: u64,
+    pub run_id: u64,
+    pub run_attempt: u32,
+    pub sha: String,
+    pub subject: String,
+    pub job_workflow_ref: Option<String>,
+    pub job_workflow_sha: Option<String>,
+    pub workflow_ref: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct RawOidcClaims {
     sub: String,
@@ -52,6 +67,155 @@ struct RawOidcClaims {
     job_workflow_sha: Option<String>,
     #[serde(default)]
     workflow_ref: Option<String>,
+}
+
+impl TryFrom<RawOidcClaims> for VerifiedOidcToken {
+    type Error = OidcError;
+
+    fn try_from(c: RawOidcClaims) -> Result<Self, Self::Error> {
+        let repository_id: u64 = c
+            .repository_id
+            .parse()
+            .map_err(|_| OidcError::UntrustedClaim("repository_id"))?;
+        let owner_id: u64 = c
+            .repository_owner_id
+            .parse()
+            .map_err(|_| OidcError::UntrustedClaim("owner_id"))?;
+        let run_id: u64 = c
+            .run_id
+            .parse()
+            .map_err(|_| OidcError::UntrustedClaim("run_id"))?;
+        let run_attempt: u32 = c
+            .run_attempt
+            .parse()
+            .map_err(|_| OidcError::UntrustedClaim("run_attempt"))?;
+
+        Ok(Self {
+            repository: c.repository,
+            repository_id,
+            owner_id,
+            run_id,
+            run_attempt,
+            sha: c.sha,
+            subject: c.sub,
+            job_workflow_ref: c.job_workflow_ref,
+            job_workflow_sha: c.job_workflow_sha,
+            workflow_ref: c.workflow_ref,
+        })
+    }
+}
+
+/// Verifies RS256 signature, issuer, audience, expiry, and parses numeric GitHub IDs
+/// before tenant-specific trust policy evaluation.
+pub async fn verify_oidc_signature(
+    jwks: &RemoteJwks,
+    issuer: &str,
+    audience: &str,
+    token: &str,
+) -> Result<VerifiedOidcToken, OidcError> {
+    if token.is_empty() || token.len() > 16_384 {
+        return Err(OidcError::MalformedToken);
+    }
+    let header = decode_header(token).map_err(|_| OidcError::MalformedToken)?;
+    if header.alg != Algorithm::RS256 {
+        return Err(OidcError::InvalidSignature);
+    }
+    let kid = header.kid.ok_or(OidcError::MalformedToken)?;
+    if kid.is_empty() || kid.len() > 128 || !kid.is_ascii() {
+        return Err(OidcError::MalformedToken);
+    }
+
+    let jwk = jwks.key(&kid).await.map_err(|err| match err {
+        JwksError::Unavailable => OidcError::JwksUnavailable,
+        JwksError::UnknownKey => OidcError::InvalidSignature,
+    })?;
+    let key = DecodingKey::from_jwk(&jwk).map_err(|_| OidcError::InvalidSignature)?;
+
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[audience]);
+    validation.validate_nbf = true;
+    validation.leeway = 10;
+
+    let data = decode::<RawOidcClaims>(token, &key, &validation)
+        .map_err(|_| OidcError::InvalidSignature)?;
+    VerifiedOidcToken::try_from(data.claims)
+}
+
+/// Enforces tenant-scoped repository, owner, subject, and workflow trust rules against
+/// a cryptographically verified [`VerifiedOidcToken`].
+pub fn validate_oidc_policy(
+    token: &VerifiedOidcToken,
+    trust: &OidcTrustConfig,
+    scope: &GitHubScope,
+) -> Result<OidcClaims, OidcError> {
+    if !scope.allows_repository(&token.repository) {
+        return Err(OidcError::UntrustedClaim("repository"));
+    }
+    if token.owner_id != trust.owner_id {
+        return Err(OidcError::UntrustedClaim("repository_or_owner"));
+    }
+    if let Some(expected_repo_id) = trust.repository_id
+        && token.repository_id != expected_repo_id
+    {
+        return Err(OidcError::UntrustedClaim("repository_or_owner"));
+    }
+    if !trust
+        .subjects
+        .iter()
+        .any(|pattern| subject_matches(pattern, &token.subject, &token.repository))
+    {
+        return Err(OidcError::UntrustedClaim("subject"));
+    }
+
+    let job_wf_ref = token
+        .job_workflow_ref
+        .as_deref()
+        .ok_or(OidcError::UntrustedClaim("job_workflow_ref"))?;
+
+    let matched_pinned = if let Some(allowed_shas) = trust.workflows.get(job_wf_ref) {
+        let job_wf_sha = token
+            .job_workflow_sha
+            .as_deref()
+            .ok_or(OidcError::UntrustedClaim("job_workflow_sha"))?;
+        if !allowed_shas.contains(job_wf_sha) {
+            return Err(OidcError::UntrustedClaim("workflow_sha"));
+        }
+        true
+    } else {
+        false
+    };
+
+    let matched_repo_path = !matched_pinned
+        && !trust.allowed_workflow_paths.is_empty()
+        && extract_repo_workflow_path(job_wf_ref, &token.repository)
+            .is_some_and(|path| trust.allowed_workflow_paths.contains(path));
+
+    if !matched_pinned && !matched_repo_path {
+        return Err(OidcError::UntrustedClaim("workflow_ref"));
+    }
+
+    if !trust.caller_workflows.is_empty() {
+        let caller = token
+            .workflow_ref
+            .as_deref()
+            .and_then(|wf| extract_repo_workflow_path(wf, &token.repository))
+            .ok_or(OidcError::UntrustedClaim("caller_workflow"))?;
+        if !trust.caller_workflows.contains(caller) {
+            return Err(OidcError::UntrustedClaim("caller_workflow"));
+        }
+    }
+
+    Ok(OidcClaims {
+        repository: token.repository.clone(),
+        repository_id: token.repository_id,
+        owner_id: token.owner_id,
+        run_id: token.run_id,
+        run_attempt: token.run_attempt,
+        sha: token.sha.clone(),
+        subject: token.subject.clone(),
+        workflow_ref: job_wf_ref.to_owned(),
+    })
 }
 
 #[derive(Debug)]
@@ -74,121 +238,15 @@ impl OidcVerifier {
     }
 
     pub async fn verify(&self, token: &str) -> Result<OidcClaims, OidcError> {
-        if token.is_empty() || token.len() > 16_384 {
-            return Err(OidcError::MalformedToken);
-        }
-        let header = decode_header(token).map_err(|_| OidcError::MalformedToken)?;
-        if header.alg != Algorithm::RS256 {
-            return Err(OidcError::InvalidSignature);
-        }
-        let kid = header.kid.ok_or(OidcError::MalformedToken)?;
-        if kid.is_empty() || kid.len() > 128 || !kid.is_ascii() {
-            return Err(OidcError::MalformedToken);
-        }
-
-        let jwk = self.jwks.key(&kid).await.map_err(|err| match err {
-            JwksError::Unavailable => OidcError::JwksUnavailable,
-            JwksError::UnknownKey => OidcError::InvalidSignature,
-        })?;
-        let key = DecodingKey::from_jwk(&jwk).map_err(|_| OidcError::InvalidSignature)?;
-
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_issuer(&[self.issuer.as_str()]);
-        validation.set_audience(&[self.trust.audience.as_str()]);
-        validation.validate_nbf = true;
-        validation.leeway = 10;
-
-        let data = decode::<RawOidcClaims>(token, &key, &validation)
-            .map_err(|_| OidcError::InvalidSignature)?;
-        self.validate_claims(data.claims)
+        let verified =
+            verify_oidc_signature(&self.jwks, &self.issuer, &self.trust.audience, token).await?;
+        validate_oidc_policy(&verified, &self.trust, &self.scope)
     }
 
+    #[cfg(test)]
     fn validate_claims(&self, c: RawOidcClaims) -> Result<OidcClaims, OidcError> {
-        let repository_id: u64 = c
-            .repository_id
-            .parse()
-            .map_err(|_| OidcError::UntrustedClaim("repository_id"))?;
-        let owner_id: u64 = c
-            .repository_owner_id
-            .parse()
-            .map_err(|_| OidcError::UntrustedClaim("owner_id"))?;
-        let run_id: u64 = c
-            .run_id
-            .parse()
-            .map_err(|_| OidcError::UntrustedClaim("run_id"))?;
-        let run_attempt: u32 = c
-            .run_attempt
-            .parse()
-            .map_err(|_| OidcError::UntrustedClaim("run_attempt"))?;
-
-        if !self.scope.allows_repository(&c.repository) {
-            return Err(OidcError::UntrustedClaim("repository"));
-        }
-        if owner_id != self.trust.owner_id {
-            return Err(OidcError::UntrustedClaim("repository_or_owner"));
-        }
-        if let Some(expected_repo_id) = self.trust.repository_id
-            && repository_id != expected_repo_id
-        {
-            return Err(OidcError::UntrustedClaim("repository_or_owner"));
-        }
-        if !self
-            .trust
-            .subjects
-            .iter()
-            .any(|pattern| subject_matches(pattern, &c.sub, &c.repository))
-        {
-            return Err(OidcError::UntrustedClaim("subject"));
-        }
-
-        let job_wf_ref = c
-            .job_workflow_ref
-            .as_deref()
-            .ok_or(OidcError::UntrustedClaim("job_workflow_ref"))?;
-
-        let matched_pinned = if let Some(allowed_shas) = self.trust.workflows.get(job_wf_ref) {
-            let job_wf_sha = c
-                .job_workflow_sha
-                .as_deref()
-                .ok_or(OidcError::UntrustedClaim("job_workflow_sha"))?;
-            if !allowed_shas.contains(job_wf_sha) {
-                return Err(OidcError::UntrustedClaim("workflow_sha"));
-            }
-            true
-        } else {
-            false
-        };
-
-        let matched_repo_path = !matched_pinned
-            && !self.trust.allowed_workflow_paths.is_empty()
-            && extract_repo_workflow_path(job_wf_ref, &c.repository)
-                .is_some_and(|path| self.trust.allowed_workflow_paths.contains(path));
-
-        if !matched_pinned && !matched_repo_path {
-            return Err(OidcError::UntrustedClaim("workflow_ref"));
-        }
-
-        if !self.trust.caller_workflows.is_empty() {
-            let caller = c
-                .workflow_ref
-                .as_deref()
-                .and_then(|wf| extract_repo_workflow_path(wf, &c.repository))
-                .ok_or(OidcError::UntrustedClaim("caller_workflow"))?;
-            if !self.trust.caller_workflows.contains(caller) {
-                return Err(OidcError::UntrustedClaim("caller_workflow"));
-            }
-        }
-
-        Ok(OidcClaims {
-            repository: c.repository,
-            repository_id,
-            owner_id,
-            run_id,
-            run_attempt,
-            sha: c.sha,
-            subject: c.sub,
-            workflow_ref: job_wf_ref.to_owned(),
-        })
+        let verified = VerifiedOidcToken::try_from(c)?;
+        validate_oidc_policy(&verified, &self.trust, &self.scope)
     }
 }
 
