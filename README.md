@@ -265,11 +265,11 @@ We prefer clear engineering boundaries over marketing claims:
 | ✓ | Auto-NVMe RAID0/ext4 & BuildKit tuning | `x64` & `arm64` Ubuntu 24.04 Packer templates |
 | ✓ | Keyless BYOC cloud identity | `IMDSv2`, STS `AssumeRole` + `ExternalId`, GCE metadata, SA impersonation, GCP→AWS federation |
 | ✓ | Turnkey Terraform & multi-arch releases | `aws-controller`, `gcp-controller`, GHCR + `.tar.gz` + Lambda zips |
-| ✓ | Bare-metal / nested-KVM microVMs | Pure-Rust `open-ci-provider-ch` (Cloud Hypervisor + XFS reflink CoW rootfs) |
+| ✓ | Bare-metal / nested-KVM microVMs | Pure-Rust `open-ci-provider-ch` (Cloud Hypervisor + XFS reflink CoW rootfs + auto-spillover) |
+| ✓ | Zero-friction CLI setup & preflight | `open-ci init` preset generator, `open-ci doctor`, and single-process `open-ci serve --with-cache` |
 | ○ | `PostgresStore` for active-active HA | Same async `Store` trait; zero domain changes |
 | ○ | Operator Web UI | Backed by existing `/api/v1/*` REST + `/api/v1/events` SSE |
 | ○ | Additional cloud providers | Hetzner, Azure, Kubernetes via `CloudProvider` trait |
-| ○ | Interactive `open-ci init` setup wizard | Generates validated `open-ci.toml` and trust policies |
 
 ---
 

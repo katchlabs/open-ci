@@ -275,8 +275,10 @@ Runs via `open-ci cache --config /etc/open-ci/open-ci.toml` on private runner-re
 
 | Command | Purpose |
 | --- | --- |
-| `open-ci serve --config <path>` | Start the control plane HTTP server and background reconciler. |
-| `open-ci cache --config <path>` | Start the GitHub Actions v2 transparent cache server. |
+| `open-ci serve --config <path> [--with-cache]` | Start the control plane HTTP server and reconciler (optionally embedding the Actions v2 cache server in the same process). |
+| `open-ci cache --config <path>` | Start the standalone GitHub Actions v2 transparent cache server. |
+| `open-ci init --preset <gcp-spot\|aws-spot\|multi-cloud\|bare-metal\|hybrid> ...` | Generate a validated `open-ci.toml` from an opinionated preset (guaranteed to pass `open-ci validate`). |
+| `open-ci doctor --config <path> [--with-cache] [--json]` | Run offline preflight checks on config, secret files/permissions, SQLite/cache paths, and Cloud Hypervisor host readiness. |
 | `open-ci demo --listen <addr>` | Launch a zero-cloud local sandbox backed by `MockProvider`. |
 | `open-ci validate --config <path>` | Validate `open-ci.toml` offline and emit capacity bounds as JSON. |
 | `open-ci ctl [--url ...] [--token ...] <status\|set-mode\|reconcile>` | Operate a running control plane over `/api/v1/*`. |

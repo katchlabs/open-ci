@@ -68,9 +68,49 @@ pub fn build_control_plane(cfg: OpenCiConfig, demo_mode: bool) -> Result<Control
 }
 
 pub async fn serve_with_reconciler(cp: ControlPlane) -> Result<()> {
+    let shutdown = CancellationToken::new();
+    let signal_token = shutdown.clone();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        tracing::info!("shutdown signal received; draining gracefully");
+        signal_token.cancel();
+    });
+    serve_with_reconciler_until(cp, shutdown).await
+}
+
+pub async fn serve_with_optional_cache(cfg: OpenCiConfig, with_cache: bool) -> Result<()> {
+    let cp = build_control_plane(cfg.clone(), false)?;
+    if !with_cache {
+        return serve_with_reconciler(cp).await;
+    }
+
+    let shutdown = CancellationToken::new();
+    let signal_token = shutdown.clone();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        tracing::info!("shutdown signal received; draining control plane and cache");
+        signal_token.cancel();
+    });
+
+    let cp_shutdown = shutdown.clone();
+    let cache_shutdown = shutdown.clone();
+    let cp_task = async move {
+        let res = serve_with_reconciler_until(cp, cp_shutdown.clone()).await;
+        cp_shutdown.cancel();
+        res
+    };
+    let cache_task = async move {
+        let res = crate::commands::cache::run_cache_until(&cfg, cache_shutdown.clone()).await;
+        cache_shutdown.cancel();
+        res
+    };
+    tokio::try_join!(cp_task, cache_task)?;
+    Ok(())
+}
+
+async fn serve_with_reconciler_until(cp: ControlPlane, shutdown: CancellationToken) -> Result<()> {
     let listen = cp.config.server.listen.clone();
     let tick_secs = cp.config.server.tick_seconds;
-    let shutdown = CancellationToken::new();
 
     let bg_cp = cp.clone();
     let bg_token = shutdown.clone();
@@ -114,13 +154,8 @@ pub async fn serve_with_reconciler(cp: ControlPlane) -> Result<()> {
         .with_context(|| format!("failed binding {listen}"))?;
     let router = build_router(cp);
 
-    let signal_token = shutdown.clone();
     axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            wait_for_shutdown_signal().await;
-            tracing::info!("shutdown signal received; draining gracefully");
-            signal_token.cancel();
-        })
+        .with_graceful_shutdown(shutdown.cancelled_owned())
         .await?;
 
     let _ = reconciler_task.await;

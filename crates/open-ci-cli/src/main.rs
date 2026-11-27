@@ -13,7 +13,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use commands::cache::run_cache;
 use commands::ctl::{CtlAction, run_ctl};
 use commands::demo::build_demo_config;
-use commands::serve::{build_control_plane, build_http_client, load_config, serve_with_reconciler};
+use commands::doctor::{DoctorArgs, run_doctor};
+use commands::init::{InitArgs, run_init};
+use commands::serve::{
+    build_control_plane, build_http_client, load_config, serve_with_optional_cache,
+    serve_with_reconciler,
+};
 use open_ci_core::{Clock, ControlMode, SystemClock};
 use open_ci_github::broker::{BrokerConfig, rotate_credentials};
 use open_ci_store::SqliteStore;
@@ -36,7 +41,14 @@ enum Command {
     Serve {
         #[arg(long, default_value = "config/open-ci.example.toml")]
         config: PathBuf,
+        /// Also run the built-in GitHub Actions v2 transparent cache server in this process.
+        #[arg(long)]
+        with_cache: bool,
     },
+    /// Generate a validated `open-ci.toml` from an opinionated preset (`gcp-spot`, `aws-spot`, `multi-cloud`, `bare-metal`, `hybrid`).
+    Init(InitArgs),
+    /// Run offline preflight checks against `open-ci.toml`, secret files, storage paths, and host prerequisites.
+    Doctor(DoctorArgs),
     /// Run the native GitHub Actions v2 transparent cache server (`LocalFs` `NVMe` or S3/R2).
     Cache {
         #[arg(long, default_value = "config/open-ci.example.toml")]
@@ -136,11 +148,12 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&summary)?);
             Ok(())
         }
-        Command::Serve { config } => {
+        Command::Serve { config, with_cache } => {
             let cfg = load_config(&config)?;
-            let cp = build_control_plane(cfg, false)?;
-            serve_with_reconciler(cp).await
+            serve_with_optional_cache(cfg, with_cache).await
         }
+        Command::Init(args) => run_init(&args),
+        Command::Doctor(args) => run_doctor(&args),
         Command::Cache { config } => {
             let cfg = load_config(&config)?;
             run_cache(&cfg).await

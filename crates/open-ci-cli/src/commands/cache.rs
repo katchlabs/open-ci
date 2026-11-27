@@ -24,6 +24,7 @@ use reqwest::Client;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const GCS_READ_WRITE_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const TOKEN_FILE_REFRESH: Duration = Duration::from_secs(60);
@@ -33,6 +34,16 @@ const STORAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const STORAGE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn run_cache(cfg: &OpenCiConfig) -> Result<()> {
+    let shutdown = CancellationToken::new();
+    let signal_token = shutdown.clone();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        signal_token.cancel();
+    });
+    run_cache_until(cfg, shutdown).await
+}
+
+pub async fn run_cache_until(cfg: &OpenCiConfig, shutdown: CancellationToken) -> Result<()> {
     let cache = cfg
         .cache
         .as_ref()
@@ -71,7 +82,7 @@ pub async fn run_cache(cfg: &OpenCiConfig) -> Result<()> {
     );
     CacheServer::new(config, store, index, verifier, Arc::new(SystemClock))
         .context("invalid cache configuration")?
-        .serve_with_shutdown(wait_for_shutdown_signal())
+        .serve_with_shutdown(shutdown.cancelled_owned())
         .await
         .context("open-ci cache server exited with error")
 }
