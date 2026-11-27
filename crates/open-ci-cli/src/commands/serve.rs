@@ -9,6 +9,7 @@ use open_ci_provider_aws::{
     AssumeRoleConfig, AwsCredentialChain, AwsCredentialsSource, AwsProvider,
     GceWebIdentityCredentials, WebIdentityConfig,
 };
+use open_ci_provider_ch::CloudHypervisorProvider;
 use open_ci_provider_gcp::{
     FileTokenSource, GcpProvider, GcpTokenSource, ImpersonatedTokenSource, ImpersonationConfig,
     MetadataTokenSource,
@@ -19,7 +20,7 @@ use open_ci_server::{ControlPlane, ServerSecrets};
 use open_ci_store::SqliteStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -75,6 +76,11 @@ pub async fn serve_with_reconciler(cp: ControlPlane) -> Result<()> {
     let bg_token = shutdown.clone();
     let reconciler_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(tick_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let notifier = bg_cp.reconcile_notifier();
+        let min_event_cooldown = Duration::from_millis(500);
+        let debounce = Duration::from_millis(100);
+        let mut last_run = Instant::now().checked_sub(min_event_cooldown);
         loop {
             tokio::select! {
                 () = bg_token.cancelled() => break,
@@ -82,6 +88,22 @@ pub async fn serve_with_reconciler(cp: ControlPlane) -> Result<()> {
                     if let Err(err) = bg_cp.reconcile_once().await {
                         tracing::error!(error = %err, "reconcile tick failed");
                     }
+                    last_run = Some(Instant::now());
+                }
+                () = notifier.notified() => {
+                    let wait = last_run
+                        .map(|t| min_event_cooldown.saturating_sub(t.elapsed()))
+                        .unwrap_or_default()
+                        .max(debounce);
+                    tokio::select! {
+                        () = bg_token.cancelled() => break,
+                        () = tokio::time::sleep(wait) => {}
+                    }
+                    if let Err(err) = bg_cp.reconcile_once().await {
+                        tracing::error!(error = %err, "event-driven reconcile failed");
+                    }
+                    last_run = Some(Instant::now());
+                    interval.reset();
                 }
             }
         }
@@ -136,6 +158,10 @@ fn build_provider_registry(cfg: &OpenCiConfig, http: &reqwest::Client) -> Result
     if let Some(aws_cfg) = cfg.aws.clone() {
         let creds = build_aws_credentials(&aws_cfg, http)?;
         registry.register(Arc::new(AwsProvider::new(aws_cfg, http.clone(), creds)));
+    }
+
+    if let Some(ch_cfg) = cfg.cloud_hypervisor.clone() {
+        registry.register(Arc::new(CloudHypervisorProvider::new(ch_cfg)));
     }
 
     Ok(registry)

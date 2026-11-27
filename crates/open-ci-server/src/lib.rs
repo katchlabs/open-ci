@@ -16,7 +16,7 @@ use open_ci_provider::ProviderRegistry;
 use open_ci_store::{Store, StoreError};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 use uuid::Uuid;
 
 /// Runtime secrets held exclusively in redacted [`SecretString`] wrappers.
@@ -89,6 +89,7 @@ pub struct ControlPlane {
     pub secrets: Arc<ServerSecrets>,
     pub events: broadcast::Sender<ControlEvent>,
     admission_tx: Arc<Mutex<()>>,
+    reconcile_notify: Arc<Notify>,
 }
 
 impl ControlPlane {
@@ -118,11 +119,20 @@ impl ControlPlane {
             secrets: Arc::new(secrets),
             events,
             admission_tx: Arc::new(Mutex::new(())),
+            reconcile_notify: Arc::new(Notify::new()),
         })
     }
 
     pub fn emit(&self, event: ControlEvent) {
         let _ = self.events.send(event);
+    }
+
+    pub fn request_reconcile(&self) {
+        self.reconcile_notify.notify_one();
+    }
+
+    pub fn reconcile_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.reconcile_notify)
     }
 
     /// Evaluates and durably persists an idempotent OIDC run admission decision (scoped runner labels).

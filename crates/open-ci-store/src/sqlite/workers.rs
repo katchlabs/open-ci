@@ -12,7 +12,24 @@ const WORKER_COLS: &str = "name, pool_id, admission_id, request_id, provider, pl
 const JOB_COLS: &str = "id, pool_id, repository, admission_id, run_id, status, conclusion, runner_name, \
     runner_id, checked_at, updated_at";
 
+const PHASE_RANK_SQL: &str = "CASE {col} \
+    WHEN 'planned' THEN 0 \
+    WHEN 'creating' THEN 1 \
+    WHEN 'live' THEN 2 \
+    WHEN 'retiring' THEN 3 \
+    WHEN 'gone' THEN 4 \
+    ELSE 0 END";
+
+const JOB_STATUS_RANK_SQL: &str = "CASE {col} \
+    WHEN 'unknown' THEN 0 \
+    WHEN 'queued' THEN 1 \
+    WHEN 'in_progress' THEN 2 \
+    WHEN 'completed' THEN 3 \
+    ELSE 0 END";
+
 pub(super) fn upsert_worker(conn: &Connection, w: &Worker) -> Result<(), StoreError> {
+    let cur_rank = PHASE_RANK_SQL.replace("{col}", "workers.phase");
+    let new_rank = PHASE_RANK_SQL.replace("{col}", "excluded.phase");
     let sql = format!(
         "INSERT INTO workers ({WORKER_COLS}) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) \
@@ -20,12 +37,12 @@ pub(super) fn upsert_worker(conn: &Connection, w: &Worker) -> Result<(), StoreEr
             pool_id = excluded.pool_id, \
             admission_id = COALESCE(workers.admission_id, excluded.admission_id), \
             provider_instance_id = COALESCE(excluded.provider_instance_id, workers.provider_instance_id), \
-            phase = excluded.phase, \
-            create_operation = excluded.create_operation, \
-            delete_operation = excluded.delete_operation, \
+            phase = CASE WHEN ({new_rank}) >= ({cur_rank}) THEN excluded.phase ELSE workers.phase END, \
+            create_operation = CASE WHEN ({new_rank}) >= ({cur_rank}) THEN excluded.create_operation ELSE workers.create_operation END, \
+            delete_operation = COALESCE(excluded.delete_operation, workers.delete_operation), \
             delete_attempts = MAX(workers.delete_attempts, excluded.delete_attempts), \
             bootstrap_used = MAX(workers.bootstrap_used, excluded.bootstrap_used), \
-            runner_id = COALESCE(excluded.runner_id, workers.runner_id), \
+            runner_id = CASE WHEN ({new_rank}) > ({cur_rank}) THEN excluded.runner_id ELSE COALESCE(excluded.runner_id, workers.runner_id) END, \
             job_id = COALESCE(excluded.job_id, workers.job_id), \
             retire_reason = COALESCE(excluded.retire_reason, workers.retire_reason), \
             updated_at = MAX(workers.updated_at, excluded.updated_at)"
@@ -111,8 +128,8 @@ pub(super) fn consume_bootstrap(
     let ts = u64_to_i64(now_unix)?;
     let tx = conn.transaction()?;
     let updated = tx.execute(
-        "UPDATE workers SET bootstrap_used = 1, updated_at = ?1 \
-         WHERE name = ?2 AND phase = 'live' AND bootstrap_used = 0",
+        "UPDATE workers SET phase = 'live', create_operation = NULL, bootstrap_used = 1, updated_at = ?1 \
+         WHERE name = ?2 AND phase IN ('creating', 'live') AND bootstrap_used = 0",
         params![ts, name],
     )?;
     if updated != 1 {
@@ -161,10 +178,26 @@ pub(super) fn observe_job_hint(
 }
 
 pub(super) fn upsert_job(conn: &Connection, j: &Job) -> Result<(), StoreError> {
-    conn.execute(
-        "INSERT OR REPLACE INTO jobs \
+    let cur_rank = JOB_STATUS_RANK_SQL.replace("{col}", "jobs.status");
+    let new_rank = JOB_STATUS_RANK_SQL.replace("{col}", "excluded.status");
+    let sql = format!(
+        "INSERT INTO jobs \
          (id, pool_id, repository, admission_id, run_id, status, conclusion, runner_name, runner_id, checked_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+         ON CONFLICT(id) DO UPDATE SET \
+            pool_id = excluded.pool_id, \
+            repository = COALESCE(excluded.repository, jobs.repository), \
+            admission_id = COALESCE(jobs.admission_id, excluded.admission_id), \
+            run_id = COALESCE(excluded.run_id, jobs.run_id), \
+            status = CASE WHEN ({new_rank}) >= ({cur_rank}) THEN excluded.status ELSE jobs.status END, \
+            conclusion = COALESCE(excluded.conclusion, jobs.conclusion), \
+            runner_name = COALESCE(excluded.runner_name, jobs.runner_name), \
+            runner_id = COALESCE(excluded.runner_id, jobs.runner_id), \
+            checked_at = COALESCE(excluded.checked_at, jobs.checked_at), \
+            updated_at = MAX(jobs.updated_at, excluded.updated_at)"
+    );
+    conn.execute(
+        &sql,
         params![
             u64_to_i64(j.id)?,
             j.pool_id,

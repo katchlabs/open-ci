@@ -36,6 +36,9 @@ pub struct WorkflowJobEvent {
     pub run_attempt: u32,
     pub head_sha: String,
     pub labels: Vec<String>,
+    pub conclusion: Option<String>,
+    pub runner_name: Option<String>,
+    pub runner_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +63,12 @@ struct RawWorkflowJob {
     head_sha: String,
     #[serde(default)]
     labels: Vec<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    runner_name: Option<String>,
+    #[serde(default)]
+    runner_id: Option<u64>,
 }
 
 const fn default_run_attempt() -> u32 {
@@ -109,6 +118,9 @@ pub fn verify_and_parse_webhook(
         run_attempt: raw.workflow_job.run_attempt.max(1),
         head_sha: raw.workflow_job.head_sha,
         labels: raw.workflow_job.labels,
+        conclusion: raw.workflow_job.conclusion,
+        runner_name: raw.workflow_job.runner_name,
+        runner_id: raw.workflow_job.runner_id,
     })
 }
 
@@ -183,5 +195,41 @@ mod tests {
             verify_and_parse_webhook(&secret, &sig3, "workflow_job", foreign, &scope),
             Err(WebhookError::RepositoryMismatch("evil/svc-auth".to_owned()))
         );
+    }
+
+    #[test]
+    fn parses_optional_runner_and_conclusion_fields_for_in_progress_and_completed() {
+        let secret = SecretString::new("0123456789abcdef0123456789abcdef");
+        let scope = GitHubScope::Repository("acme/app".to_owned());
+
+        let queued = br#"{"action":"queued","repository":{"full_name":"acme/app"},"workflow_job":{"id":42,"run_id":7,"labels":["self-hosted","open-ci-api"]}}"#;
+        let q_sig = sign_webhook_body(&secret, queued).unwrap_or_default();
+        let q_ev = verify_and_parse_webhook(&secret, &q_sig, "workflow_job", queued, &scope);
+        assert!(matches!(
+            q_ev,
+            Ok(ev) if ev.conclusion.is_none() && ev.runner_name.is_none() && ev.runner_id.is_none()
+        ));
+
+        let in_progress = br#"{"action":"in_progress","repository":{"full_name":"acme/app"},"workflow_job":{"id":42,"run_id":7,"labels":["self-hosted","open-ci-api"],"runner_name":"open-ci-api-abc","runner_id":9001}}"#;
+        let ip_sig = sign_webhook_body(&secret, in_progress).unwrap_or_default();
+        let ip_ev = verify_and_parse_webhook(&secret, &ip_sig, "workflow_job", in_progress, &scope);
+        assert!(matches!(
+            ip_ev,
+            Ok(ev) if ev.action == "in_progress"
+                && ev.conclusion.is_none()
+                && ev.runner_name.as_deref() == Some("open-ci-api-abc")
+                && ev.runner_id == Some(9001)
+        ));
+
+        let completed = br#"{"action":"completed","repository":{"full_name":"acme/app"},"workflow_job":{"id":42,"run_id":7,"labels":["self-hosted","open-ci-api"],"conclusion":"success","runner_name":"open-ci-api-abc","runner_id":9001}}"#;
+        let c_sig = sign_webhook_body(&secret, completed).unwrap_or_default();
+        let c_ev = verify_and_parse_webhook(&secret, &c_sig, "workflow_job", completed, &scope);
+        assert!(matches!(
+            c_ev,
+            Ok(ev) if ev.action == "completed"
+                && ev.conclusion.as_deref() == Some("success")
+                && ev.runner_name.as_deref() == Some("open-ci-api-abc")
+                && ev.runner_id == Some(9001)
+        ));
     }
 }

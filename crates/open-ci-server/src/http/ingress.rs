@@ -7,7 +7,7 @@ use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use open_ci_core::{AdmissionRequest, AdmissionStatus, WorkerUsage};
+use open_ci_core::{AdmissionRequest, AdmissionStatus, ControlEvent, Job, JobStatus, WorkerUsage};
 use open_ci_github::{WebhookError, WorkflowJobEvent, verify_and_parse_webhook};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -92,6 +92,54 @@ async fn webhook(
     }
 }
 
+async fn record_webhook_job(
+    cp: &ControlPlane,
+    parsed: &WorkflowJobEvent,
+    pool_id: &str,
+    admission_id: Option<&str>,
+    now: u64,
+) -> Result<(), ApiError> {
+    if matches!(parsed.action.as_str(), "in_progress" | "completed") {
+        let status = JobStatus::parse(&parsed.action);
+        let job = Job {
+            id: parsed.job_id,
+            pool_id: pool_id.to_owned(),
+            repository: Some(parsed.repository.clone()),
+            admission_id: admission_id.map(str::to_owned),
+            run_id: Some(parsed.run_id),
+            status,
+            conclusion: parsed.conclusion.clone(),
+            runner_name: parsed.runner_name.clone(),
+            runner_id: parsed.runner_id,
+            checked_at: Some(now),
+            updated_at: now,
+        };
+        cp.store
+            .upsert_job(&job)
+            .await
+            .map_err(crate::ServerError::Store)?;
+        cp.emit(ControlEvent::JobChanged {
+            job_id: job.id,
+            pool_id: pool_id.to_owned(),
+            status,
+            timestamp: now,
+        });
+    } else {
+        cp.store
+            .observe_job_hint(
+                parsed.job_id,
+                pool_id,
+                Some(&parsed.repository),
+                admission_id,
+                Some(parsed.run_id),
+                now,
+            )
+            .await
+            .map_err(crate::ServerError::Store)?;
+    }
+    Ok(())
+}
+
 async fn handle_oidc_mode_webhook(
     cp: &ControlPlane,
     parsed: &WorkflowJobEvent,
@@ -102,9 +150,11 @@ async fn handle_oidc_mode_webhook(
         .list_held_admissions()
         .await
         .map_err(crate::ServerError::Store)?;
-    let matching_admission = held
-        .iter()
-        .find(|a| a.repository == parsed.repository && a.run_id == parsed.run_id);
+    let matching_admission = held.iter().find(|a| {
+        a.repository == parsed.repository
+            && a.run_id == parsed.run_id
+            && a.run_attempt == parsed.run_attempt
+    });
 
     let mut matched = false;
     for (pool_id, pool) in &cp.config.pools {
@@ -117,22 +167,20 @@ async fn handle_oidc_mode_webhook(
         if pool.accepts_labels(&parsed.labels, scoped.as_deref())
             || pool.accepts_labels(&parsed.labels, None)
         {
-            cp.store
-                .observe_job_hint(
-                    parsed.job_id,
-                    pool_id,
-                    Some(&parsed.repository),
-                    matching_admission.map(|a| a.id.as_str()),
-                    Some(parsed.run_id),
-                    now,
-                )
-                .await
-                .map_err(crate::ServerError::Store)?;
+            record_webhook_job(
+                cp,
+                parsed,
+                pool_id,
+                matching_admission.map(|a| a.id.as_str()),
+                now,
+            )
+            .await?;
             matched = true;
         }
     }
 
     if matched {
+        cp.request_reconcile();
         Ok(StatusCode::ACCEPTED)
     } else {
         Ok(StatusCode::NO_CONTENT)
@@ -159,28 +207,14 @@ async fn handle_webhook_auto_admission(
                 continue;
             };
             if pool.accepts_labels(&parsed.labels, Some(expected_label)) {
-                cp.store
-                    .observe_job_hint(
-                        parsed.job_id,
-                        pool_id,
-                        Some(&parsed.repository),
-                        Some(&existing.id),
-                        Some(parsed.run_id),
-                        now,
-                    )
-                    .await
-                    .map_err(crate::ServerError::Store)?;
+                record_webhook_job(cp, parsed, pool_id, Some(&existing.id), now).await?;
                 matched = true;
             }
         }
-        return Ok(if matched {
-            StatusCode::ACCEPTED
-        } else {
-            StatusCode::NO_CONTENT
-        });
-    }
-
-    if parsed.action != "queued" {
+        if matched {
+            cp.request_reconcile();
+            return Ok(StatusCode::ACCEPTED);
+        }
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -192,6 +226,18 @@ async fn handle_webhook_auto_admission(
         .map(|(pool_id, _)| pool_id.clone())
         .collect();
     if matched_pools.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    if matches!(parsed.action.as_str(), "in_progress" | "completed") {
+        for pool_id in &matched_pools {
+            record_webhook_job(cp, parsed, pool_id, None, now).await?;
+        }
+        cp.request_reconcile();
+        return Ok(StatusCode::ACCEPTED);
+    }
+
+    if parsed.action != "queued" {
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -208,19 +254,10 @@ async fn handle_webhook_auto_admission(
     }
 
     for pool_id in &matched_pools {
-        cp.store
-            .observe_job_hint(
-                parsed.job_id,
-                pool_id,
-                Some(&parsed.repository),
-                Some(&decision.reservation),
-                Some(parsed.run_id),
-                now,
-            )
-            .await
-            .map_err(crate::ServerError::Store)?;
+        record_webhook_job(cp, parsed, pool_id, Some(&decision.reservation), now).await?;
     }
 
+    cp.request_reconcile();
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -275,6 +312,9 @@ async fn admit(
     };
 
     let decision = cp.admit(&req).await?;
+    if decision.admitted {
+        cp.request_reconcile();
+    }
     Ok(Json(decision))
 }
 

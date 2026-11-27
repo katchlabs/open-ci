@@ -18,6 +18,7 @@ open-ci-core = { workspace = true }
 open-ci-github = { workspace = true }
 open-ci-provider = { workspace = true }
 open-ci-provider-aws = { workspace = true }
+open-ci-provider-ch = { workspace = true }
 open-ci-provider-gcp = { workspace = true }
 open-ci-provider-mock = { workspace = true }
 open-ci-server = { workspace = true }
