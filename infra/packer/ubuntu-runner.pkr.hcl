@@ -59,8 +59,8 @@ variable "gcp_machine_type" {
 
 variable "gcp_disk_type" {
   type        = string
-  default     = "pd-ssd"
-  description = "GCP boot disk type for the temporary Packer builder VM."
+  default     = ""
+  description = "Optional GCP boot disk type override (auto-selects hyperdisk-balanced for c4*/n4* machines, pd-ssd otherwise)."
 }
 
 variable "aws_region" {
@@ -110,6 +110,7 @@ locals {
   image_family    = "open-ci-ubuntu-2404-${var.arch}"
   image_name      = "${local.image_family}-${local.image_timestamp}"
   gcp_machine     = var.gcp_machine_type != "" ? var.gcp_machine_type : (var.arch == "arm64" ? "t2a-standard-4" : "n2d-standard-4")
+  gcp_disk        = var.gcp_disk_type != "" ? var.gcp_disk_type : (startswith(local.gcp_machine, "c4") || startswith(local.gcp_machine, "n4") ? "hyperdisk-balanced" : "pd-ssd")
   gcp_source      = var.arch == "arm64" ? "ubuntu-2404-lts-arm64" : "ubuntu-2404-lts-amd64"
   aws_instance    = var.aws_instance_type != "" ? var.aws_instance_type : (var.arch == "arm64" ? "c7g.xlarge" : "c7a.xlarge")
   aws_arch        = var.arch == "arm64" ? "arm64" : "x86_64"
@@ -123,7 +124,7 @@ source "googlecompute" "ubuntu_runner" {
   image_family        = local.image_family
   machine_type        = local.gcp_machine
   disk_size           = var.disk_size_gb
-  disk_type           = var.gcp_disk_type
+  disk_type           = local.gcp_disk
   ssh_username        = "packer"
   image_labels = {
     open-ci-managed = "true"
