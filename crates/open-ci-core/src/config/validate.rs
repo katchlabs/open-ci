@@ -849,6 +849,12 @@ fn validate_cloud_hypervisor(cfg: &OpenCiConfig) -> Result<(), ConfigError> {
             "must be within 512..=524288",
         ));
     }
+    if ch.max_instances == Some(0) {
+        return Err(ConfigError::invalid(
+            "cloud_hypervisor.max_instances",
+            "must be >= 1 when set",
+        ));
+    }
     Ok(())
 }
 
@@ -1291,6 +1297,7 @@ subnet = "open-ci-br0"
     #[test]
     fn cloud_hypervisor_config_and_placements_validate() {
         assert!(parse_ch("", "").is_ok());
+        assert!(parse_ch("max_instances = 4", "").is_ok());
         assert!(parse_ch("", "threads_per_core = 1").is_ok());
 
         let invalid_ch_cases = [
@@ -1319,6 +1326,7 @@ subnet = "open-ci-br0"
                 "default_memory_mib = 524289",
                 "cloud_hypervisor.default_memory_mib",
             ),
+            ("max_instances = 0", "cloud_hypervisor.max_instances"),
         ];
         for (extra, expected_field) in invalid_ch_cases {
             assert_eq!(

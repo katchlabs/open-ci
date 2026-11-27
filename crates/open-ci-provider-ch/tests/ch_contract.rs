@@ -13,7 +13,7 @@ use open_ci_core::ProviderKind;
 use open_ci_core::config::{CloudHypervisorProviderConfig, Placement};
 #[cfg(unix)]
 use open_ci_provider::{
-    CloudProvider, InstanceSpec, InstanceStatus, OperationRef, OperationStatus,
+    CloudProvider, InstanceSpec, InstanceStatus, OperationRef, OperationStatus, ProviderError,
 };
 #[cfg(unix)]
 use open_ci_provider_ch::{CloudHypervisorProvider, RuntimeMode};
@@ -79,6 +79,7 @@ fn test_ch_config(root: &Path) -> Result<CloudHypervisorProviderConfig, std::io:
         pin_physical_cpus: true,
         default_vcpus: 4,
         default_memory_mib: 16_384,
+        max_instances: None,
     })
 }
 
@@ -436,4 +437,65 @@ fn slot_allocator_is_deterministic_and_collision_free() {
     assert_ne!(second.tap_name, first.tap_name);
     assert!(second.tap_name.starts_with("oci-"));
     assert!(second.tap_name.len() <= MAX_IFNAMSIZ);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn max_instances_cap_returns_capacity_unavailable_for_hybrid_spillover() {
+    let dir_res = TempDir::new();
+    assert!(dir_res.is_ok());
+    let Ok(dir) = dir_res else { return };
+
+    let cfg_res = test_ch_config(dir.path());
+    assert!(cfg_res.is_ok());
+    let Ok(mut cfg) = cfg_res else { return };
+    cfg.max_instances = Some(1);
+
+    let socket_path = dir.path().join("mock-ch-cap.sock");
+    let server_res = spawn_mock_ch_server(&socket_path);
+    assert!(server_res.is_ok());
+
+    let provider = CloudHypervisorProvider::with_runtime_mode(
+        cfg.clone(),
+        RuntimeMode::ExternalSocket { socket_path },
+    );
+    let placement = test_placement("ch-4c-16g");
+
+    let mk_spec = |name: &str| InstanceSpec {
+        worker_name: name.to_owned(),
+        pool_id: "hybrid".to_owned(),
+        request_id: format!("req-{name}"),
+        placement: placement.clone(),
+        disk_gb: 64,
+        lifetime_seconds: 1800,
+        expires_at_unix: 2000,
+        user_data: "{}".to_owned(),
+    };
+
+    assert!(
+        provider
+            .create_instance(&mk_spec("open-ci-ch-a"))
+            .await
+            .is_ok()
+    );
+
+    let overflow = provider.create_instance(&mk_spec("open-ci-ch-b")).await;
+    assert!(matches!(
+        overflow,
+        Err(ProviderError::CapacityUnavailable { ref zone }) if zone == "local-1"
+    ));
+    assert!(!PathBuf::from(&cfg.state_dir).join("open-ci-ch-b").exists());
+
+    assert!(
+        provider
+            .delete_instance(&placement, "open-ci-ch-a", None)
+            .await
+            .is_ok()
+    );
+    assert!(
+        provider
+            .create_instance(&mk_spec("open-ci-ch-b"))
+            .await
+            .is_ok()
+    );
 }

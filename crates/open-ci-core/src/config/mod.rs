@@ -159,6 +159,8 @@ pub struct CloudHypervisorProviderConfig {
     pub default_vcpus: u32,
     #[serde(default = "default_ch_memory_mib")]
     pub default_memory_mib: u64,
+    #[serde(default)]
+    pub max_instances: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -33,6 +33,8 @@ memory_hugepages = false
 pin_physical_cpus = false
 default_vcpus = 4
 default_memory_mib = 16384
+# Cap simultaneous local microVMs; exceeding it triggers automatic spillover to Spot placements in hybrid pools.
+# max_instances = 4
 
 [cache]
 listen = "10.200.0.1:8090"
