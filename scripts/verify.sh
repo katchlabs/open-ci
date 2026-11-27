@@ -83,6 +83,7 @@ gate "Gate 3/7: Offline Config Validation"
 cargo run --quiet --bin open-ci -- validate --config config/open-ci.example.toml
 cargo run --quiet --bin open-ci -- validate --config config/open-ci.high-perf.example.toml
 cargo run --quiet --bin open-ci -- validate --config config/open-ci.cloud-hypervisor.example.toml
+cargo run --quiet --bin open-ci -- validate --config config/open-ci.hybrid-byoc.example.toml
 
 # ---------------------------------------------------------------------------
 # Gate 4: Real Compiled-Binary Runtime Proof (reusable driver)
@@ -123,12 +124,12 @@ else
   echo "  warn: terraform not installed; skipping terraform fmt -check"
 fi
 
-bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh
-echo "  ok: bash -n passed for verify.sh, drive.sh, Packer, and Cloud Hypervisor scripts"
+bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh
+echo "  ok: bash -n passed for verify.sh, drive.sh, Packer, Cloud Hypervisor, and BYOC scripts"
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh
-  echo "  ok: shellcheck passed for Packer and Cloud Hypervisor scripts"
+  shellcheck infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh
+  echo "  ok: shellcheck passed for Packer, Cloud Hypervisor, and BYOC scripts"
 else
   echo "  warn: shellcheck not installed; skipping shellcheck"
 fi
@@ -137,6 +138,18 @@ if ! grep -Eq 'http_tokens[[:space:]]*=[[:space:]]*"required"' infra/terraform/m
   fail "Policy check failed: set http_tokens = \"required\" in infra/terraform/modules/aws-controller/main.tf to enforce IMDSv2."
 fi
 echo "  ok: policy check AWS Terraform IMDSv2 http_tokens = \"required\""
+
+if grep -Eq 'iam:PassRole' infra/terraform/modules/aws-byoc/main.tf infra/cloudformation/open-ci-aws-byoc.yaml; then
+  fail "Policy check failed: AWS BYOC templates must never grant iam:PassRole (runners must stay zero-IAM)."
+fi
+if ! grep -Fq 'ec2:MetadataHttpTokens' infra/terraform/modules/aws-byoc/main.tf \
+  || ! grep -Fq 'ec2:MetadataHttpTokens' infra/cloudformation/open-ci-aws-byoc.yaml; then
+  fail "Policy check failed: AWS BYOC templates must enforce ec2:MetadataHttpTokens = required."
+fi
+if grep -Eq '"iam\.serviceAccounts\.actAs"|iam\.serviceAccounts\.actAs,' infra/terraform/modules/gcp-byoc/main.tf infra/scripts/connect-gcp-byoc.sh; then
+  fail "Policy check failed: GCP BYOC templates must never grant iam.serviceAccounts.actAs (runners must stay zero-IAM)."
+fi
+echo "  ok: policy check BYOC IaC (zero iam:PassRole, zero actAs, IMDSv2 required)"
 
 if ! grep -Fq '"MetadataOptions.HttpTokens"' crates/open-ci-provider-aws/src/params.rs \
   || ! grep -Eq '"MetadataOptions\.HttpTokens",[[:space:]]*"required"' crates/open-ci-provider-aws/src/params.rs; then
