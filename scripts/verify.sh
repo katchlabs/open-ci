@@ -130,11 +130,11 @@ else
   echo "  warn: terraform not installed; skipping terraform fmt -check"
 fi
 
-bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh infra/scripts/setup-cache-nvme.sh
+bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/packer/scripts/tune-host.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh infra/scripts/setup-cache-nvme.sh
 echo "  ok: bash -n passed for verify.sh, drive.sh, deploy/install.sh, Packer, Cloud Hypervisor, and BYOC scripts"
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh infra/scripts/setup-cache-nvme.sh
+  shellcheck deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/packer/scripts/tune-host.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh infra/scripts/setup-cache-nvme.sh
   echo "  ok: shellcheck passed for deploy/install.sh, Packer, Cloud Hypervisor, and BYOC scripts"
 else
   echo "  warn: shellcheck not installed; skipping shellcheck"

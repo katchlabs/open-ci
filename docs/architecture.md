@@ -209,13 +209,13 @@ When `[cache]` is configured in `open-ci.toml` and `OPEN_CI_CACHE_SIGNING_KEY_FI
 
 ### Boot-Time Auto-NVMe & Kernel Tuning (`infra/packer`)
 
-Packer-built Ubuntu 24.04 images (`x64` and `arm64`) install `/usr/local/sbin/open-ci-setup-nvme.sh` as `open-ci-nvme.service` (`Before=docker.service`):
+Packer-built Ubuntu 24.04 images (`x64` and `arm64`) run [`infra/packer/scripts/tune-host.sh`](../infra/packer/scripts/tune-host.sh), which installs `/usr/local/sbin/open-ci-setup-nvme.sh` as `open-ci-nvme.service` (`Before=docker.service cloud-final.service google-startup-scripts.service`, so the GCE `startup-script` agent bootstrap never races the mount). The same script is the idempotent fallback for stock Ubuntu 24.04 VMs (`sudo tune-host.sh --now`):
 
 1. Resolves the root block device via `findmnt`/`lsblk` and explicitly excludes network-attached persistent volumes (`Elastic Block Store`, `PersistentDisk`, `Persistent Disk`, `Hyperdisk`, `nvme_card-pd`) and partitioned disks.
 2. Uses a single local NVMe drive or stripes 2+ local NVMe drives into `/dev/md0` RAID0 (`mdadm --chunk=256`). Under `OPEN_CI_NVME_PAGE_CACHE=auto` (default), hosts with `>= 14 GiB` RAM mount an XFS-backed 4K-sector `ext4` image sized to 85% of the NVMe volume for page-cache-accelerated I/O; smaller VMs mount direct `ext4` (`-O ^has_journal`, `noatime,nodiratime`).
 3. Mounts at `/mnt/nvme`, creates `/mnt/nvme/docker`, `/mnt/nvme/work`, `/mnt/nvme/tmp`, and rewrites `/etc/docker/daemon.json` to set `"data-root": "/mnt/nvme/docker"`.
 4. `open-ci agent bootstrap` probes `/mnt/nvme/work` and `/mnt/nvme/tmp` for writability and injects `RUNNER_WORKDIR=/mnt/nvme/work` and `TMPDIR=/mnt/nvme/tmp`.
-5. `/etc/sysctl.d/99-open-ci.conf` raises `fs.inotify.max_user_watches=524288`, `fs.inotify.max_user_instances=1024`, configures `fq` + `cubic` with 64 MiB max TCP buffers, and lowers `vm.swappiness=1`; Docker runs `overlay2` with BuildKit enabled and 10 concurrent pulls/pushes.
+5. `/etc/dpkg/dpkg.cfg.d/01-open-ci-speedup` sets `force-unsafe-io`; `/etc/sysctl.d/99-open-ci.conf` raises `fs.inotify.max_user_watches=524288`, `fs.inotify.max_user_instances=1024`, configures `fq` + `cubic` with 64 MiB max TCP buffers, and lowers `vm.swappiness=1`; Docker runs `overlay2` with BuildKit enabled and 10 concurrent pulls/pushes.
 
 ---
 

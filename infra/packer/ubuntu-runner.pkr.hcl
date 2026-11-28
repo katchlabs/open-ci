@@ -29,6 +29,12 @@ variable "github_runner_version" {
   description = "Pinned actions/runner release version."
 }
 
+variable "open_ci_version" {
+  type        = string
+  default     = "0.2.1"
+  description = "open-ci release baked into the image; pins the GCP image name referenced by `open-ci init`."
+}
+
 variable "github_runner_sha256" {
   type        = string
   description = "Pinned SHA-256 checksum for the actions/runner archive."
@@ -108,7 +114,7 @@ variable "install_docker" {
 locals {
   image_timestamp = formatdate("YYYYMMDD-hhmmss", timestamp())
   image_family    = "open-ci-ubuntu-2404-${var.arch}"
-  image_name      = "${local.image_family}-${local.image_timestamp}"
+  image_name      = "${local.image_family}-v${replace(var.open_ci_version, ".", "-")}-r${replace(var.github_runner_version, ".", "-")}"
   gcp_machine     = var.gcp_machine_type != "" ? var.gcp_machine_type : (var.arch == "arm64" ? "t2a-standard-4" : "n2d-standard-4")
   gcp_disk        = var.gcp_disk_type != "" ? var.gcp_disk_type : (startswith(local.gcp_machine, "c4") || startswith(local.gcp_machine, "n4") ? "hyperdisk-balanced" : "pd-ssd")
   gcp_source      = var.arch == "arm64" ? "ubuntu-2404-lts-arm64" : "ubuntu-2404-lts-amd64"
@@ -129,6 +135,7 @@ source "googlecompute" "ubuntu_runner" {
   image_labels = {
     open-ci-managed = "true"
     open-ci-arch    = var.arch
+    open-ci-built   = lower(local.image_timestamp)
   }
 }
 
@@ -138,7 +145,7 @@ source "amazon-ebs" "ubuntu_runner" {
   vpc_id        = var.aws_vpc_id != "" ? var.aws_vpc_id : null
   subnet_id     = var.aws_subnet_id != "" ? var.aws_subnet_id : null
   ssh_username  = "ubuntu"
-  ami_name      = local.image_name
+  ami_name      = "${local.image_name}-${local.image_timestamp}"
 
   source_ami_filter {
     filters = {
@@ -181,6 +188,11 @@ build {
   provisioner "file" {
     source      = "${path.root}/scripts/setup-nvme.sh"
     destination = "/tmp/setup-nvme.sh"
+  }
+
+  provisioner "file" {
+    source      = "${path.root}/scripts/tune-host.sh"
+    destination = "/tmp/tune-host.sh"
   }
 
   provisioner "shell" {
