@@ -25,7 +25,7 @@ variable "arch" {
 
 variable "github_runner_version" {
   type        = string
-  default     = "2.323.0"
+  default     = "2.338.2"
   description = "Pinned actions/runner release version."
 }
 

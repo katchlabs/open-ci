@@ -139,7 +139,7 @@ packer build \
   ubuntu-runner.pkr.hcl
 ```
 
-> **Note:** Look up the exact SHA-256 checksum for your `github_runner_version` (default `2.323.0`) on the [`actions/runner` releases page](https://github.com/actions/runner/releases).
+> **Note:** Look up the exact SHA-256 checksum for your `github_runner_version` (default `2.338.2`) on the [`actions/runner` releases page](https://github.com/actions/runner/releases).
 
 ---
 
