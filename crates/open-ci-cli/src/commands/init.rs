@@ -119,8 +119,7 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
     println!();
     println!("Next steps:");
     println!(
-        "  1. Bake runner images with infra/packer ({}) and replace any AWS placeholder IDs in {}",
-        runner_image_name("<arch>"),
+        "  1. Replace any AWS placeholder IDs in {} (GCP uses public {PUBLIC_GCP_IMAGE_PROJECT} images)",
         resolved.output.display()
     );
     println!(
@@ -262,7 +261,7 @@ pub fn render_init_config(args: &InitArgs) -> Result<String> {
     )?;
     writeln!(
         out,
-        "# GCP images/subnets match infra/packer + infra/terraform defaults; replace AWS placeholder IDs before live use."
+        "# GCP uses public pre-baked images and the infra/terraform subnet; replace AWS placeholder IDs before live use."
     )?;
     writeln!(out)?;
 
@@ -328,11 +327,7 @@ fn write_providers(out: &mut String, args: &InitArgs) -> Result<()> {
             out,
             "compute_url = \"https://compute.googleapis.com/compute/v1\""
         )?;
-        writeln!(
-            out,
-            "image = \"{}\"",
-            gcp_image_path(&args.gcp_project, PoolArch::X64)
-        )?;
+        writeln!(out, "image = \"{}\"", public_gcp_image(PoolArch::X64))?;
         writeln!(
             out,
             "# Direct egress via ephemeral external IPv4 (no Cloud NAT fees or caps); the"
@@ -492,22 +487,16 @@ impl PoolArch {
     }
 }
 
-/// Pinned `actions/runner` release baked by `infra/packer/ubuntu-runner.pkr.hcl`.
-pub const GITHUB_RUNNER_VERSION: &str = "2.338.2";
+/// Project hosting the pre-baked runner images, readable by `allAuthenticatedUsers`.
+pub const PUBLIC_GCP_IMAGE_PROJECT: &str = "open-ci-public-images";
 
-/// Deterministic Packer image name pinned to this `open-ci` release and [`GITHUB_RUNNER_VERSION`].
-pub fn runner_image_name(arch: &str) -> String {
-    format!(
-        "open-ci-ubuntu-2404-{arch}-v{}-r{}",
-        env!("CARGO_PKG_VERSION").replace('.', "-"),
-        GITHUB_RUNNER_VERSION.replace('.', "-")
-    )
-}
+/// Image tag pinned to `open-ci` v0.2.1 and `actions/runner` v2.338.2.
+const PUBLIC_GCP_IMAGE_TAG: &str = "v021-r2";
 
-fn gcp_image_path(project: &str, arch: PoolArch) -> String {
+fn public_gcp_image(arch: PoolArch) -> String {
     format!(
-        "projects/{project}/global/images/{}",
-        runner_image_name(arch.name())
+        "projects/{PUBLIC_GCP_IMAGE_PROJECT}/global/images/open-ci-ubuntu-2404-{}-{PUBLIC_GCP_IMAGE_TAG}",
+        arch.name()
     )
 }
 
@@ -591,11 +580,7 @@ fn write_pool(out: &mut String, args: &InitArgs, arch: PoolArch) -> Result<()> {
                 "subnet = \"projects/{}/regions/{region}/subnetworks/open-ci-runners-{region}\"",
                 args.gcp_project
             )?;
-            writeln!(
-                out,
-                "image = \"{}\"",
-                gcp_image_path(&args.gcp_project, arch)
-            )?;
+            writeln!(out, "image = \"{}\"", public_gcp_image(arch))?;
             writeln!(out, "disk_type = \"hyperdisk-balanced\"")?;
             writeln!(out, "disk_interface = \"NVME\"")?;
             writeln!(out, "nic_type = \"GVNIC\"")?;
@@ -717,11 +702,11 @@ mod tests {
             let gcp = cfg.gcp.as_ref();
             assert!(gcp.is_some_and(|g| g.external_ipv4), "{preset:?}");
             assert!(gcp.is_some_and(|g| g.network_tags == ["open-ci-runner"]));
-            assert!(gcp.is_some_and(|g| g.image.ends_with(&runner_image_name("x64"))));
+            assert!(gcp.is_some_and(|g| g.image == public_gcp_image(PoolArch::X64)));
 
             for (pool, machine, tpc, arch) in [
-                ("linux-x64", "c4d-standard-8-lssd", Some(1), "x64"),
-                ("linux-arm64", "c4a-standard-4-lssd", None, "arm64"),
+                ("linux-x64", "c4d-standard-8-lssd", Some(1), PoolArch::X64),
+                ("linux-arm64", "c4a-standard-4-lssd", None, PoolArch::Arm64),
             ] {
                 let placements = gcp_placements(&cfg, pool);
                 let zones: Vec<&str> = placements.iter().map(|p| p.zone.as_str()).collect();
@@ -739,12 +724,7 @@ mod tests {
                         placement.subnet,
                         "projects/acme-ci-prod/regions/us-central1/subnetworks/open-ci-runners-us-central1"
                     );
-                    assert!(
-                        placement
-                            .image
-                            .as_deref()
-                            .is_some_and(|i| i.ends_with(&runner_image_name(arch)))
-                    );
+                    assert_eq!(placement.image, Some(public_gcp_image(arch)));
                 }
             }
         }
@@ -788,19 +768,28 @@ mod tests {
     }
 
     #[test]
-    fn pinned_runner_image_matches_packer_defaults_and_example_configs() {
+    fn public_images_match_release_packer_defaults_and_example_configs() {
         let hcl = include_str!("../../../../infra/packer/ubuntu-runner.pkr.hcl");
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(
+            PUBLIC_GCP_IMAGE_TAG.starts_with(&format!("v{}-", version.replace('.', ""))),
+            "publish open-ci-ubuntu-2404-<arch>-v{version}-* to {PUBLIC_GCP_IMAGE_PROJECT} and bump PUBLIC_GCP_IMAGE_TAG"
+        );
         assert_eq!(
             packer_variable_default(hcl, "open_ci_version").as_deref(),
-            Some(env!("CARGO_PKG_VERSION")),
+            Some(version),
             "bump open_ci_version in infra/packer/ubuntu-runner.pkr.hcl to the workspace version"
         );
         assert_eq!(
             packer_variable_default(hcl, "github_runner_version").as_deref(),
-            Some(GITHUB_RUNNER_VERSION),
-            "keep GITHUB_RUNNER_VERSION in sync with github_runner_version in ubuntu-runner.pkr.hcl"
+            Some("2.338.2"),
+            "rebuild and republish the public images when github_runner_version changes"
         );
 
+        let allowed: Vec<String> = [PoolArch::X64, PoolArch::Arm64]
+            .into_iter()
+            .map(|arch| format!("image = \"{}\"", public_gcp_image(arch)))
+            .collect();
         for (path, text) in [
             (
                 "config/open-ci.example.toml",
@@ -816,13 +805,9 @@ mod tests {
             ),
         ] {
             for line in text.lines().filter(|l| l.contains("/global/images/")) {
-                let pinned = ["x64", "arm64"]
-                    .iter()
-                    .any(|arch| line.ends_with(&format!("/{}\"", runner_image_name(arch))));
                 assert!(
-                    pinned,
-                    "{path}: GCP image must be pinned to {}: {line}",
-                    runner_image_name("<arch>")
+                    allowed.iter().any(|a| a == line),
+                    "{path}: GCP image must be a public {PUBLIC_GCP_IMAGE_PROJECT} image: {line}"
                 );
             }
             let cfg = OpenCiConfig::parse_toml(text);

@@ -117,7 +117,7 @@ tar -xzf open-ci-aarch64-unknown-linux-gnu.tar.gz -C dist/arm64
 
 `infra/packer/ubuntu-runner.pkr.hcl` bakes the official pinned `actions/runner` archive (SHA-256 verified), `/usr/local/bin/open-ci`, Docker Engine with BuildKit + `overlay2`, and [`scripts/tune-host.sh`](../infra/packer/scripts/tune-host.sh) host tuning (`/etc/sysctl.d/99-open-ci.conf`, dpkg `force-unsafe-io`, and `open-ci-nvme.service` for boot-time page-cache `ext4`/RAID0 mounting of local ephemeral NVMe SSDs).
 
-GCP images are named after the pinned versions (`open-ci-ubuntu-2404-<arch>-v0-2-1-r2-338-2` for `open_ci_version = 0.2.1` and `github_runner_version = 2.338.2`), which is exactly what `open-ci init` and the example configs reference, so no image IDs need editing. Pass `-force` to `packer build` to rebuild an image with the same versions.
+> **GCP: Packer is optional.** `open-ci init` and the example configs default to public pre-baked images in project `open-ci-public-images`, readable by any authenticated principal (`roles/compute.imageUser` on `allAuthenticatedUsers`): `projects/open-ci-public-images/global/images/open-ci-ubuntu-2404-x64-v021-r2` and `…-arm64-v021-r2` (open-ci `v0.2.1`, `actions/runner` `v2.338.2`). Bake your own only to customize the image. Self-built GCP images are named `open-ci-ubuntu-2404-<arch>-v0-2-1-r2-338-2` in your project: point `gcp.image` and each placement `image` at them, and pass `-force` to `packer build` to rebuild the same versions.
 
 ```bash
 cd infra/packer
@@ -155,7 +155,7 @@ sudo ./open-ci/infra/packer/scripts/tune-host.sh --now
 findmnt /mnt/nvme && sysctl fs.inotify.max_user_watches
 ```
 
-`--now` applies `/etc/sysctl.d/99-open-ci.conf` and mounts `/mnt/nvme` immediately; `open-ci-nvme.service` re-mounts it on every boot. Managed runners still need the baked image, because the GCE `startup-script` runs `/usr/local/bin/open-ci agent bootstrap`.
+`--now` applies `/etc/sysctl.d/99-open-ci.conf` and mounts `/mnt/nvme` immediately; `open-ci-nvme.service` re-mounts it on every boot. Managed runners still need a baked image (the public default or your own), because the GCE `startup-script` runs `/usr/local/bin/open-ci agent bootstrap`.
 
 ---
 
