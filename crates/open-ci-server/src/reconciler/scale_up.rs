@@ -202,24 +202,27 @@ impl ControlPlane {
         err: &ProviderError,
         now: u64,
     ) {
-        let (duration, reason) = match err {
-            ProviderError::QuotaExceeded { .. } => (QUOTA_BACKOFF_SECONDS, "quota_exceeded"),
-            ProviderError::CapacityUnavailable { .. } => {
-                (CAPACITY_BACKOFF_SECONDS, "capacity_unavailable")
-            }
+        let backoff = match err {
+            ProviderError::QuotaExceeded { .. } => PlacementBackoff::regional(
+                placement,
+                now.saturating_add(QUOTA_BACKOFF_SECONDS),
+                "quota_exceeded",
+            ),
+            ProviderError::CapacityUnavailable { .. } => PlacementBackoff::zonal(
+                placement,
+                now.saturating_add(CAPACITY_BACKOFF_SECONDS),
+                "capacity_unavailable",
+            ),
             ProviderError::RateLimited {
                 retry_after_seconds,
-            } => (*retry_after_seconds, "rate_limited"),
+            } => PlacementBackoff::regional(
+                placement,
+                now.saturating_add(*retry_after_seconds),
+                "rate_limited",
+            ),
             _ => return,
         };
-        let retry_after = now.saturating_add(duration);
-        let backoff = PlacementBackoff {
-            provider: placement.provider,
-            region: placement.region.clone(),
-            family: placement.machine_family().to_owned(),
-            retry_after,
-            reason: reason.to_owned(),
-        };
+        let retry_after = backoff.retry_after;
         if self.store.upsert_backoff(&backoff).await.is_ok() {
             self.emit(ControlEvent::BackoffTriggered {
                 provider: backoff.provider,

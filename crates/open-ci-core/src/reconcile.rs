@@ -141,13 +141,7 @@ pub fn is_placement_backed_off(
     backoffs: &[PlacementBackoff],
     now_unix: u64,
 ) -> bool {
-    let family = placement.machine_family();
-    backoffs.iter().any(|b| {
-        b.provider == placement.provider
-            && b.region == placement.region
-            && b.family == family
-            && b.retry_after > now_unix
-    })
+    backoffs.iter().any(|b| b.blocks(placement, now_unix))
 }
 
 /// Selects the next ready placement index according to pool weights, cheapest-first,

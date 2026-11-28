@@ -61,6 +61,8 @@ terraform apply \
   -var="domain=ci.example.com"
 ```
 
+The runner subnet (`open-ci-runners-<region>`), `open-ci-runner` deny-all-ingress firewall tag (priority `100`), and runner role (including `compute.subnetworks.useExternalIp`) match the `open-ci init` GCP presets, so runners egress directly over ephemeral external IPv4 without Cloud NAT data-processing fees or bandwidth caps while exposing zero inbound ports. Presets place each pool in `us-central1-a` → `us-central1-b` → `us-central1-c`; a Spot stockout backs off only the affected zone. For regions without an `-a` zone, pass `open-ci init --zone us-east1-b,us-east1-c,us-east1-d`.
+
 ### Path C: Multi-Cloud (`multi-cloud`)
 
 ```bash
@@ -113,7 +115,9 @@ tar -xzf open-ci-aarch64-unknown-linux-gnu.tar.gz -C dist/arm64
 
 ### 2.2 Build Hardened `x64` / `arm64` Ubuntu 24.04 Runner Images
 
-`infra/packer/ubuntu-runner.pkr.hcl` bakes the official pinned `actions/runner` archive (SHA-256 verified), `/usr/local/bin/open-ci`, Docker Engine with BuildKit + `overlay2`, sysctl inotify tuning (`fs.inotify.max_user_watches=524288`), and `open-ci-nvme.service` (`/usr/local/sbin/open-ci-setup-nvme.sh`) for automatic boot-time `ext4`/RAID0 mounting of local ephemeral NVMe SSDs.
+`infra/packer/ubuntu-runner.pkr.hcl` bakes the official pinned `actions/runner` archive (SHA-256 verified), `/usr/local/bin/open-ci`, Docker Engine with BuildKit + `overlay2`, and [`scripts/tune-host.sh`](../infra/packer/scripts/tune-host.sh) host tuning (`/etc/sysctl.d/99-open-ci.conf`, dpkg `force-unsafe-io`, and `open-ci-nvme.service` for boot-time page-cache `ext4`/RAID0 mounting of local ephemeral NVMe SSDs).
+
+> **GCP: Packer is optional.** `open-ci init` and the example configs default to public pre-baked images in project `open-ci-public-images`, readable by any authenticated principal (`roles/compute.imageUser` on `allAuthenticatedUsers`): `projects/open-ci-public-images/global/images/open-ci-ubuntu-2404-x64-v021-r2` and `…-arm64-v021-r2` (open-ci `v0.2.1`, `actions/runner` `v2.338.2`). Bake your own only to customize the image. Self-built GCP images are named `open-ci-ubuntu-2404-<arch>-v0-2-1-r2-338-2` in your project: point `gcp.image` and each placement `image` at them, and pass `-force` to `packer build` to rebuild the same versions.
 
 ```bash
 cd infra/packer
@@ -140,6 +144,18 @@ packer build \
 ```
 
 > **Note:** Look up the exact SHA-256 checksum for your `github_runner_version` (default `2.338.2`) on the [`actions/runner` releases page](https://github.com/actions/runner/releases).
+
+### 2.3 Stock Ubuntu 24.04 Fallback (Before Baking)
+
+If you boot a stock `ubuntu-2404-lts` VM (for example to benchmark before running Packer), apply the same tuning so local NVMe mounts as page-cache `ext4` instead of leaving work on the network boot disk. The script is idempotent and installs missing `xfsprogs`/`mdadm`:
+
+```bash
+git clone --depth 1 https://github.com/katchlabs/open-ci.git
+sudo ./open-ci/infra/packer/scripts/tune-host.sh --now
+findmnt /mnt/nvme && sysctl fs.inotify.max_user_watches
+```
+
+`--now` applies `/etc/sysctl.d/99-open-ci.conf` and mounts `/mnt/nvme` immediately; `open-ci-nvme.service` re-mounts it on every boot. Managed runners still need a baked image (the public default or your own), because the GCE `startup-script` runs `/usr/local/bin/open-ci agent bootstrap`.
 
 ---
 

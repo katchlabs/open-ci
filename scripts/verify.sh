@@ -130,11 +130,11 @@ else
   echo "  warn: terraform not installed; skipping terraform fmt -check"
 fi
 
-bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh infra/scripts/setup-cache-nvme.sh
+bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/packer/scripts/tune-host.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh infra/scripts/setup-cache-nvme.sh
 echo "  ok: bash -n passed for verify.sh, drive.sh, deploy/install.sh, Packer, Cloud Hypervisor, and BYOC scripts"
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh infra/scripts/setup-cache-nvme.sh
+  shellcheck deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/packer/scripts/tune-host.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh infra/scripts/setup-cache-nvme.sh
   echo "  ok: shellcheck passed for deploy/install.sh, Packer, Cloud Hypervisor, and BYOC scripts"
 else
   echo "  warn: shellcheck not installed; skipping shellcheck"
@@ -155,7 +155,20 @@ fi
 if grep -Eq '"iam\.serviceAccounts\.actAs"|iam\.serviceAccounts\.actAs,' infra/terraform/modules/gcp-byoc/main.tf infra/scripts/connect-gcp-byoc.sh; then
   fail "Policy check failed: GCP BYOC templates must never grant iam.serviceAccounts.actAs (runners must stay zero-IAM)."
 fi
-echo "  ok: policy check BYOC IaC (zero iam:PassRole, zero actAs, IMDSv2 required)"
+for gcp_role_file in infra/terraform/modules/gcp-byoc/main.tf infra/terraform/modules/gcp-foundation/main.tf infra/scripts/connect-gcp-byoc.sh; do
+  if ! grep -Eq '"compute\.subnetworks\.useExternalIp"|compute\.subnetworks\.useExternalIp,' "$gcp_role_file"; then
+    fail "Policy check failed: grant compute.subnetworks.useExternalIp in ${gcp_role_file} so external_ipv4 = true runners egress directly (no Cloud NAT fees/caps) behind the zero-ingress runner tag."
+  fi
+done
+for gcp_fw_file in infra/terraform/modules/gcp-byoc/main.tf infra/terraform/modules/gcp-foundation/main.tf; do
+  if ! awk '/resource "google_compute_firewall" "deny_runner_ingress"/{r=1} r&&/^}/{r=0} r&&/priority[[:space:]]*=[[:space:]]*100$/{found=1} END{exit !found}' "$gcp_fw_file"; then
+    fail "Policy check failed: set priority = 100 on deny_runner_ingress in ${gcp_fw_file} so allow rules in reused VPCs never expose external_ipv4 runners."
+  fi
+done
+if ! grep -Eq '^FW_PRIORITY=100$' infra/scripts/connect-gcp-byoc.sh; then
+  fail "Policy check failed: keep FW_PRIORITY=100 in infra/scripts/connect-gcp-byoc.sh so allow rules in reused VPCs never expose external_ipv4 runners."
+fi
+echo "  ok: policy check BYOC IaC (zero iam:PassRole, zero actAs, IMDSv2 required, GCP useExternalIp granted, deny-ingress priority 100)"
 
 if ! grep -Fq '"MetadataOptions.HttpTokens"' crates/open-ci-provider-aws/src/params.rs \
   || ! grep -Eq '"MetadataOptions\.HttpTokens",[[:space:]]*"required"' crates/open-ci-provider-aws/src/params.rs; then

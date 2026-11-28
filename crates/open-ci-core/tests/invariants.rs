@@ -324,6 +324,36 @@ proptest! {
     }
 }
 
+proptest! {
+    #[test]
+    fn zonal_stockout_fails_over_to_sibling_zone_while_quota_benches_region(
+        stocked_out in 0usize..3,
+        now in 1_000u64..1_000_000,
+    ) {
+        let mut cfg = sample_config(32, 16, 500);
+        let pool = cfg.pools.get_mut("api").ok_or_else(|| TestCaseError::fail("missing pool"))?;
+        pool.placements = ["a", "b", "c"]
+            .iter()
+            .map(|z| mock_placement("us-central1", &format!("us-central1-{z}"), "c4a-standard-4-lssd", "s"))
+            .collect();
+        let pool = cfg.pools.get("api").ok_or_else(|| TestCaseError::fail("missing pool"))?;
+        let stocked = pool.placements.get(stocked_out).ok_or_else(|| TestCaseError::fail("idx"))?;
+
+        let zonal = vec![PlacementBackoff::zonal(stocked, now + 90, "capacity_unavailable")];
+        let mut cursor = 0;
+        let chosen = select_placement(pool, &zonal, &mut cursor, now);
+        prop_assert!(chosen.is_some());
+        prop_assert_ne!(chosen, Some(stocked_out));
+        prop_assert_eq!(chosen, Some(usize::from(stocked_out == 0)));
+
+        let regional = vec![PlacementBackoff::regional(stocked, now + 300, "quota_exceeded")];
+        prop_assert_eq!(select_placement(pool, &regional, &mut cursor, now), None);
+
+        let expired = vec![PlacementBackoff::zonal(stocked, now, "capacity_unavailable")];
+        prop_assert_eq!(select_placement(pool, &expired, &mut cursor, now), Some(0));
+    }
+}
+
 #[test]
 fn reruns_always_route_to_fallback() {
     let cfg = sample_config(32, 16, 500);

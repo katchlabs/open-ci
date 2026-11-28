@@ -241,6 +241,13 @@ struct E2eHarness {
 }
 
 async fn setup_e2e_harness(gh_url: String) -> Option<E2eHarness> {
+    setup_e2e_harness_with(gh_url, |_| {}).await
+}
+
+async fn setup_e2e_harness_with(
+    gh_url: String,
+    customize: impl FnOnce(&mut OpenCiConfig),
+) -> Option<E2eHarness> {
     let dir = tempdir().ok()?;
     let clock = Arc::new(ManualClock::new(10_000));
     let store = SqliteStore::open(&dir.path().join("open-ci.db"), 10_000).ok()?;
@@ -267,7 +274,8 @@ async fn setup_e2e_harness(gh_url: String) -> Option<E2eHarness> {
     let mut registry = ProviderRegistry::new();
     registry.register(Arc::new(mock.clone()));
 
-    let cfg = test_config(gh_url.clone());
+    let mut cfg = test_config(gh_url.clone());
+    customize(&mut cfg);
     let scope = cfg.github_scope();
     let secrets = ServerSecrets {
         webhook_secret: SecretString::new("0123456789abcdef0123456789abcdef"),
@@ -471,6 +479,59 @@ fn retired_as_lost(worker: Option<&Worker>) -> bool {
         w.phase == WorkerPhase::Retiring
             && w.retire_reason.as_deref() == Some("instance_terminated")
     })
+}
+
+#[tokio::test]
+async fn zonal_stockout_fails_over_to_sibling_zone_in_same_region() {
+    let gh_state = Arc::new(Mutex::new(FakeGitHubState {
+        job_status: "queued".to_owned(),
+        ..FakeGitHubState::default()
+    }));
+    let harness = setup_e2e_harness_with(start_fake_github(gh_state).await, |cfg| {
+        if let Some(pool) = cfg.pools.get_mut("api") {
+            pool.placements = vec![
+                mock_placement("us-central1", "us-central1-a", "c4a-standard-4-lssd", "s"),
+                mock_placement("us-central1", "us-central1-b", "c4a-standard-4-lssd", "s"),
+            ];
+        }
+    })
+    .await;
+    assert!(harness.is_some());
+    let Some(harness) = harness else { return };
+    harness
+        .mock
+        .inject_create_fault(ProviderError::CapacityUnavailable {
+            zone: "us-central1-a".to_owned(),
+        })
+        .await;
+
+    let app = build_router(harness.cp.clone());
+    let delivered =
+        send_signed_webhook(&app, &harness.secrets.webhook_secret, QUEUED_JOB_WEBHOOK).await;
+    assert_eq!(delivered, Some(StatusCode::ACCEPTED));
+    let _ = harness.cp.reconcile_once().await;
+
+    let backoffs = harness
+        .store
+        .list_active_backoffs(harness.clock.now_unix())
+        .await
+        .unwrap_or_default();
+    assert_eq!(backoffs.len(), 1);
+    assert_eq!(backoffs[0].region, "us-central1-a");
+    assert_eq!(backoffs[0].reason, "capacity_unavailable");
+
+    tick(&harness, 5).await;
+    let workers = harness
+        .store
+        .list_workers(Some("api"))
+        .await
+        .unwrap_or_default();
+    assert!(
+        workers
+            .iter()
+            .any(|w| w.zone == "us-central1-b" && w.phase.is_active()),
+        "a us-central1-a stockout must fail over to us-central1-b within the backoff window: {workers:?}"
+    );
 }
 
 #[tokio::test]

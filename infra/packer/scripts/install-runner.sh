@@ -9,24 +9,11 @@ INSTALL_DOCKER="${INSTALL_DOCKER:-true}"
 
 export DEBIAN_FRONTEND=noninteractive
 
-cat <<'EOF' > /etc/dpkg/dpkg.cfg.d/01-open-ci-speedup
-force-unsafe-io
-EOF
-
-cat <<'EOF' > /etc/apt/apt.conf.d/99-open-ci-speedup
-Acquire::Languages "none";
-Acquire::GzipIndexes "false";
-Acquire::http::Pipeline-Depth "10";
-Acquire::Queue-Mode "host";
-EOF
-
-if command -v debconf-set-selections >/dev/null 2>&1; then
-  printf 'man-db man-db/auto-update boolean false\n' | debconf-set-selections
+if [[ ! -f /tmp/tune-host.sh ]]; then
+  echo "ERROR: /tmp/tune-host.sh missing; upload infra/packer/scripts/tune-host.sh before install-runner.sh." >&2
+  exit 1
 fi
-rm -f /var/lib/man-db/auto-update
-if dpkg -s needrestart >/dev/null 2>&1; then
-  apt-get purge -y -qq needrestart || true
-fi
+bash /tmp/tune-host.sh
 
 apt-get update -qq
 PACKAGES=(
@@ -57,58 +44,6 @@ apt-get install -y --no-install-recommends "${PACKAGES[@]}"
 # Install the open-ci agent binary baked into the image.
 install -m 0755 /tmp/open-ci /usr/local/bin/open-ci
 rm -f /tmp/open-ci
-
-# Install boot-time local NVMe ephemeral SSD setup script and systemd oneshot unit.
-if [[ -f /tmp/setup-nvme.sh ]]; then
-  install -m 0755 /tmp/setup-nvme.sh /usr/local/sbin/open-ci-setup-nvme.sh
-  rm -f /tmp/setup-nvme.sh
-fi
-
-cat <<'EOF' > /etc/systemd/system/open-ci-nvme.service
-[Unit]
-Description=Auto-configure local ephemeral NVMe storage for open-ci runner
-After=local-fs.target
-Before=docker.service cloud-final.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/open-ci-setup-nvme.sh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl enable open-ci-nvme.service
-
-cat <<'EOF' > /etc/sysctl.d/99-open-ci.conf
-fs.inotify.max_user_watches = 524288
-fs.inotify.max_user_instances = 1024
-vm.swappiness = 1
-vm.dirty_ratio = 40
-vm.dirty_background_ratio = 10
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = cubic
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-net.ipv4.tcp_rmem = 4096 262144 67108864
-net.ipv4.tcp_wmem = 4096 262144 67108864
-net.ipv4.tcp_adv_win_scale = 1
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_fastopen = 3
-net.core.netdev_max_backlog = 32768
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing = 1
-EOF
-
-systemctl mask \
-  apt-daily.timer \
-  apt-daily-upgrade.timer \
-  apt-daily.service \
-  apt-daily-upgrade.service \
-  unattended-upgrades.service \
-  man-db.timer 2>/dev/null || true
 
 # Configure Docker Engine for high-speed CI (BuildKit, overlay2, parallel pulls/pushes).
 if [[ "${INSTALL_DOCKER}" == "true" ]]; then

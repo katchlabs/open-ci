@@ -112,7 +112,7 @@ PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 ```
 
-- **Tables:** `schema_migrations`, `control_state` (singleton row `id = 1`), `pool_state` (routing cursor & last discovery timestamp), `admissions` (unique on `(repository, run_id, run_attempt)`), `workers` (unique `request_id`, monotonic phase, `bootstrap_used` flag), `jobs`, `worker_usage`, `placement_backoffs` (primary key `(provider, region, family)`), and `audit_log`.
+- **Tables:** `schema_migrations`, `control_state` (singleton row `id = 1`), `pool_state` (routing cursor & last discovery timestamp), `admissions` (unique on `(repository, run_id, run_attempt)`), `workers` (unique `request_id`, monotonic phase, `bootstrap_used` flag), `jobs`, `worker_usage`, `placement_backoffs` (primary key `(provider, region, family)`, where `region` holds a region for regional backoffs or a zone for zonal stockouts), and `audit_log`.
 - **Single-writer fencing:** Opening `SqliteStore` acquires an exclusive `fs2` OS lock on `<database_path>.lock`, preventing two `open-ci serve` processes from writing the same database simultaneously.
 - **No permission TOCTOU:** The database file, lockfile, `-wal`, and `-shm` sidecars are pre-created and enforced with `0o600` permissions on Unix.
 - **Consistent online backups:** `open-ci backup --config ... --output ...` opens the live database read-only (`SQLITE_OPEN_READ_ONLY`) without colliding with the writer lockfile, runs SQLite's Online Backup API (`128` pages per step), writes to a `0o600` temporary file, and atomically renames it into place.
@@ -156,7 +156,7 @@ Each pool defines one or more `[[pools.<id>.placements]]` across GCP and/or AWS 
 
 ### Placement Selection (`open_ci_core::reconcile::select_placement`)
 
-1. **Filter active backoffs:** Any placement whose `(provider, region, machine_family)` has an unexpired backoff is skipped.
+1. **Filter active backoffs:** Any placement whose `(provider, region or zone, machine_family)` has an unexpired backoff is skipped.
 2. **Weighted provider selection:** If `provider_weights` is configured (e.g. `gcp = 1, aws = 1`), the durable `routing_cursor` distributes launches across ready providers proportional to weight.
 3. **Within-provider order:** If `prefer_cheapest = true`, selects the first ready placement in configured order (list cheapest placements first); otherwise round-robins across ready placements.
 
@@ -164,10 +164,10 @@ Each pool defines one or more `[[pools.<id>.placements]]` across GCP and/or AWS 
 
 When a cloud launch fails, provider errors are classified deterministically:
 - `ProviderError::QuotaExceeded` → 300-second regional `(provider, region, family)` backoff.
-- `ProviderError::CapacityUnavailable` (Spot stockout / `InsufficientInstanceCapacity` / `SpotMaxPriceTooLow` / `Unsupported` instance type in the AZ / `ZONE_RESOURCE_POOL_EXHAUSTED`) → 90-second backoff.
-- `ProviderError::RateLimited` → `retry_after_seconds` backoff (default 30s).
+- `ProviderError::CapacityUnavailable` (Spot stockout / `InsufficientInstanceCapacity` / `SpotMaxPriceTooLow` / `Unsupported` instance type in the AZ / `ZONE_RESOURCE_POOL_EXHAUSTED`) → 90-second zonal `(provider, zone, family)` backoff, so sibling zones in the same region (e.g. `us-central1-a` → `us-central1-b` → `us-central1-c`) stay selectable.
+- `ProviderError::RateLimited` → `retry_after_seconds` regional backoff (default 30s).
 
-The next reconciler tick immediately spills demand onto healthy regions, families, or the secondary cloud.
+The next reconciler tick immediately spills demand onto healthy zones, regions, families, or the secondary cloud.
 
 ### Monotonic Worker Phases
 
@@ -209,13 +209,13 @@ When `[cache]` is configured in `open-ci.toml` and `OPEN_CI_CACHE_SIGNING_KEY_FI
 
 ### Boot-Time Auto-NVMe & Kernel Tuning (`infra/packer`)
 
-Packer-built Ubuntu 24.04 images (`x64` and `arm64`) install `/usr/local/sbin/open-ci-setup-nvme.sh` as `open-ci-nvme.service` (`Before=docker.service`):
+Packer-built Ubuntu 24.04 images (`x64` and `arm64`) run [`infra/packer/scripts/tune-host.sh`](../infra/packer/scripts/tune-host.sh), which installs `/usr/local/sbin/open-ci-setup-nvme.sh` as `open-ci-nvme.service` (`Before=docker.service cloud-final.service google-startup-scripts.service`, so the GCE `startup-script` agent bootstrap never races the mount). The same script is the idempotent fallback for stock Ubuntu 24.04 VMs (`sudo tune-host.sh --now`):
 
 1. Resolves the root block device via `findmnt`/`lsblk` and explicitly excludes network-attached persistent volumes (`Elastic Block Store`, `PersistentDisk`, `Persistent Disk`, `Hyperdisk`, `nvme_card-pd`) and partitioned disks.
 2. Uses a single local NVMe drive or stripes 2+ local NVMe drives into `/dev/md0` RAID0 (`mdadm --chunk=256`). Under `OPEN_CI_NVME_PAGE_CACHE=auto` (default), hosts with `>= 14 GiB` RAM mount an XFS-backed 4K-sector `ext4` image sized to 85% of the NVMe volume for page-cache-accelerated I/O; smaller VMs mount direct `ext4` (`-O ^has_journal`, `noatime,nodiratime`).
 3. Mounts at `/mnt/nvme`, creates `/mnt/nvme/docker`, `/mnt/nvme/work`, `/mnt/nvme/tmp`, and rewrites `/etc/docker/daemon.json` to set `"data-root": "/mnt/nvme/docker"`.
 4. `open-ci agent bootstrap` probes `/mnt/nvme/work` and `/mnt/nvme/tmp` for writability and injects `RUNNER_WORKDIR=/mnt/nvme/work` and `TMPDIR=/mnt/nvme/tmp`.
-5. `/etc/sysctl.d/99-open-ci.conf` raises `fs.inotify.max_user_watches=524288`, `fs.inotify.max_user_instances=1024`, configures `fq` + `cubic` with 64 MiB max TCP buffers, and lowers `vm.swappiness=1`; Docker runs `overlay2` with BuildKit enabled and 10 concurrent pulls/pushes.
+5. `/etc/dpkg/dpkg.cfg.d/01-open-ci-speedup` sets `force-unsafe-io`; `/etc/sysctl.d/99-open-ci.conf` raises `fs.inotify.max_user_watches=524288`, `fs.inotify.max_user_instances=1024`, configures `fq` + `cubic` with 64 MiB max TCP buffers, and lowers `vm.swappiness=1`; Docker runs `overlay2` with BuildKit enabled and 10 concurrent pulls/pushes.
 
 ---
 
@@ -245,7 +245,7 @@ Keep bound to loopback (`127.0.0.1:8080`) or private VPN and block on the public
 | `GET` | `/api/v1/workers` | Active and historical workers (`?pool_id=<id>` optional filter). |
 | `GET` | `/api/v1/jobs` | Observed GitHub jobs and routing status (`?pool_id=<id>` optional filter). |
 | `GET` | `/api/v1/admissions` | Recent admission records (`?limit=<n>`, default 100, max 500). |
-| `GET` | `/api/v1/backoffs` | Currently active regional quota/capacity/rate-limit backoffs. |
+| `GET` | `/api/v1/backoffs` | Currently active regional quota/rate-limit and zonal capacity backoffs. |
 | `GET` | `/api/v1/audit` | Durable operator mutation audit log (`?limit=<n>`, default 100, max 500). |
 | `POST` | `/api/v1/control/mode` | Transition control mode (`active`, `fallback-only`, `draining`, `paused`) with `actor` and `reason` (max 256 bytes each). |
 | `POST` | `/api/v1/reconcile` | Trigger one immediate reconciliation pass and return `ReconcileSummary`. |

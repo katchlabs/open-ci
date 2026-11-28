@@ -55,7 +55,7 @@ resource "google_compute_firewall" "deny_runner_ingress" {
   name        = "${var.name_prefix}-deny-runner-ingress"
   network     = google_compute_network.runners.id
   direction   = "INGRESS"
-  priority    = 65534
+  priority    = 100
   target_tags = ["${var.name_prefix}-runner"]
 
   deny {
@@ -89,6 +89,7 @@ resource "google_project_iam_custom_role" "runner_controller" {
     "compute.instances.setMetadata",
     "compute.instances.setTags",
     "compute.subnetworks.use",
+    "compute.subnetworks.useExternalIp",
     "compute.zoneOperations.get",
     "compute.zones.get",
   ]
