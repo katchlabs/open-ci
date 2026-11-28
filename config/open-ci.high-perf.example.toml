@@ -20,8 +20,10 @@ oidc_issuer = "https://token.actions.githubusercontent.com"
 [gcp]
 project = "your-gcp-project-id"
 compute_url = "https://compute.googleapis.com/compute/v1"
-image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-x64-20260101-000000"
-external_ipv4 = false
+image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-x64-v0-2-1-r2-338-2"
+# Direct egress via ephemeral external IPv4 (no Cloud NAT fees or caps); the
+# open-ci-runner tag's deny-all ingress firewall keeps zero inbound ports open.
+external_ipv4 = true
 network_tier = "PREMIUM"
 network_tags = ["open-ci-runner"]
 
@@ -122,16 +124,48 @@ spot = true
 provider = "gcp"
 region = "us-central1"
 zone = "us-central1-a"
-machine_type = "c4d-standard-4-lssd"
-subnet = "projects/your-gcp-project-id/regions/us-central1/subnetworks/open-ci"
-image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-x64-20260101-000000"
+machine_type = "c4d-standard-8-lssd"
+subnet = "projects/your-gcp-project-id/regions/us-central1/subnetworks/open-ci-runners-us-central1"
+image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-x64-v0-2-1-r2-338-2"
 disk_type = "hyperdisk-balanced"
 disk_interface = "NVME"
 nic_type = "GVNIC"
 local_ssd_count = 1
 network_bandwidth_tier = "TIER_1"
-# Optional: disable SMT for 1 physical core per vCPU (pair with an 8-vCPU shape for 4 physical cores).
-# threads_per_core = 1
+# SMT off: 8 hardware threads -> 4 full physical cores exposed as 4 vCPUs.
+threads_per_core = 1
+spot = true
+
+# Same-region zone failover: a us-central1-a Spot stockout backs off only that zone.
+[[pools.linux-x64.placements]]
+provider = "gcp"
+region = "us-central1"
+zone = "us-central1-b"
+machine_type = "c4d-standard-8-lssd"
+subnet = "projects/your-gcp-project-id/regions/us-central1/subnetworks/open-ci-runners-us-central1"
+image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-x64-v0-2-1-r2-338-2"
+disk_type = "hyperdisk-balanced"
+disk_interface = "NVME"
+nic_type = "GVNIC"
+local_ssd_count = 1
+network_bandwidth_tier = "TIER_1"
+threads_per_core = 1
+spot = true
+
+# Same-region zone failover: a us-central1-b Spot stockout backs off only that zone.
+[[pools.linux-x64.placements]]
+provider = "gcp"
+region = "us-central1"
+zone = "us-central1-c"
+machine_type = "c4d-standard-8-lssd"
+subnet = "projects/your-gcp-project-id/regions/us-central1/subnetworks/open-ci-runners-us-central1"
+image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-x64-v0-2-1-r2-338-2"
+disk_type = "hyperdisk-balanced"
+disk_interface = "NVME"
+nic_type = "GVNIC"
+local_ssd_count = 1
+network_bandwidth_tier = "TIER_1"
+threads_per_core = 1
 spot = true
 
 [pools.linux-arm64]
@@ -170,8 +204,38 @@ provider = "gcp"
 region = "us-central1"
 zone = "us-central1-a"
 machine_type = "c4a-standard-4-lssd"
-subnet = "projects/your-gcp-project-id/regions/us-central1/subnetworks/open-ci"
-image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-arm64-20260101-000000"
+subnet = "projects/your-gcp-project-id/regions/us-central1/subnetworks/open-ci-runners-us-central1"
+image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-arm64-v0-2-1-r2-338-2"
+disk_type = "hyperdisk-balanced"
+disk_interface = "NVME"
+nic_type = "GVNIC"
+local_ssd_count = 1
+network_bandwidth_tier = "TIER_1"
+spot = true
+
+# Same-region zone failover: a us-central1-a Spot stockout backs off only that zone.
+[[pools.linux-arm64.placements]]
+provider = "gcp"
+region = "us-central1"
+zone = "us-central1-b"
+machine_type = "c4a-standard-4-lssd"
+subnet = "projects/your-gcp-project-id/regions/us-central1/subnetworks/open-ci-runners-us-central1"
+image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-arm64-v0-2-1-r2-338-2"
+disk_type = "hyperdisk-balanced"
+disk_interface = "NVME"
+nic_type = "GVNIC"
+local_ssd_count = 1
+network_bandwidth_tier = "TIER_1"
+spot = true
+
+# Same-region zone failover: a us-central1-b Spot stockout backs off only that zone.
+[[pools.linux-arm64.placements]]
+provider = "gcp"
+region = "us-central1"
+zone = "us-central1-c"
+machine_type = "c4a-standard-4-lssd"
+subnet = "projects/your-gcp-project-id/regions/us-central1/subnetworks/open-ci-runners-us-central1"
+image = "projects/your-gcp-project-id/global/images/open-ci-ubuntu-2404-arm64-v0-2-1-r2-338-2"
 disk_type = "hyperdisk-balanced"
 disk_interface = "NVME"
 nic_type = "GVNIC"

@@ -44,9 +44,10 @@ pub struct InitArgs {
     /// Primary cloud region override.
     #[arg(long)]
     pub region: Option<String>,
-    /// Primary cloud availability zone override.
-    #[arg(long)]
-    pub zone: Option<String>,
+    /// Comma-separated zone failover order (GCP presets default to `<region>-a,<region>-b,<region>-c`;
+    /// `aws-spot` uses the first zone). Required for GCP regions without an `-a` zone (e.g. `us-east1`).
+    #[arg(long = "zone", value_delimiter = ',')]
+    pub zones: Vec<String>,
     /// Include an ARM64 runner pool (`open-ci-linux-arm64`) alongside x64.
     #[arg(long)]
     pub arm64: bool,
@@ -118,7 +119,8 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
     println!();
     println!("Next steps:");
     println!(
-        "  1. Replace placeholder subnet/image IDs in {}",
+        "  1. Bake runner images with infra/packer ({}) and replace any AWS placeholder IDs in {}",
+        runner_image_name("<arch>"),
         resolved.output.display()
     );
     println!(
@@ -260,7 +262,7 @@ pub fn render_init_config(args: &InitArgs) -> Result<String> {
     )?;
     writeln!(
         out,
-        "# Replace placeholder image, subnet, and security group IDs before live use."
+        "# GCP images/subnets match infra/packer + infra/terraform defaults; replace AWS placeholder IDs before live use."
     )?;
     writeln!(out)?;
 
@@ -328,10 +330,18 @@ fn write_providers(out: &mut String, args: &InitArgs) -> Result<()> {
         )?;
         writeln!(
             out,
-            "image = \"projects/{}/global/images/open-ci-ubuntu-2404-x64-v1\"",
-            args.gcp_project
+            "image = \"{}\"",
+            gcp_image_path(&args.gcp_project, PoolArch::X64)
         )?;
-        writeln!(out, "external_ipv4 = false")?;
+        writeln!(
+            out,
+            "# Direct egress via ephemeral external IPv4 (no Cloud NAT fees or caps); the"
+        )?;
+        writeln!(
+            out,
+            "# open-ci-runner tag's deny-all ingress firewall keeps zero inbound ports open."
+        )?;
+        writeln!(out, "external_ipv4 = true")?;
         writeln!(out, "network_tier = \"PREMIUM\"")?;
         writeln!(out, "network_tags = [\"open-ci-runner\"]")?;
         writeln!(out)?;
@@ -432,27 +442,118 @@ fn write_admission(out: &mut String, args: &InitArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PoolArch {
+    X64,
+    Arm64,
+}
+
+impl PoolArch {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::X64 => "x64",
+            Self::Arm64 => "arm64",
+        }
+    }
+
+    const fn fallback_label(self) -> &'static str {
+        match self {
+            Self::X64 => "ubuntu-24.04",
+            Self::Arm64 => "ubuntu-24.04-arm",
+        }
+    }
+
+    const fn gcp_machine_type(self) -> &'static str {
+        match self {
+            Self::X64 => "c4d-standard-8-lssd",
+            Self::Arm64 => "c4a-standard-4-lssd",
+        }
+    }
+
+    const fn gcp_threads_per_core(self) -> Option<u32> {
+        match self {
+            Self::X64 => Some(1),
+            Self::Arm64 => None,
+        }
+    }
+
+    const fn aws_machine_type(self) -> &'static str {
+        match self {
+            Self::X64 => "c7ad.xlarge",
+            Self::Arm64 => "c8gd.xlarge",
+        }
+    }
+
+    const fn aws_image(self) -> &'static str {
+        match self {
+            Self::X64 => "ami-0123456789abcdef0",
+            Self::Arm64 => "ami-0fedcba9876543210",
+        }
+    }
+}
+
+/// Pinned `actions/runner` release baked by `infra/packer/ubuntu-runner.pkr.hcl`.
+pub const GITHUB_RUNNER_VERSION: &str = "2.338.2";
+
+/// Deterministic Packer image name pinned to this `open-ci` release and [`GITHUB_RUNNER_VERSION`].
+pub fn runner_image_name(arch: &str) -> String {
+    format!(
+        "open-ci-ubuntu-2404-{arch}-v{}-r{}",
+        env!("CARGO_PKG_VERSION").replace('.', "-"),
+        GITHUB_RUNNER_VERSION.replace('.', "-")
+    )
+}
+
+fn gcp_image_path(project: &str, arch: PoolArch) -> String {
+    format!(
+        "projects/{project}/global/images/{}",
+        runner_image_name(arch.name())
+    )
+}
+
+fn gcp_region(args: &InitArgs) -> &str {
+    args.region.as_deref().unwrap_or("us-central1")
+}
+
+fn gcp_zones(args: &InitArgs) -> Vec<String> {
+    if args.zones.is_empty() {
+        let region = gcp_region(args);
+        ["a", "b", "c"]
+            .iter()
+            .map(|suffix| format!("{region}-{suffix}"))
+            .collect()
+    } else {
+        args.zones.clone()
+    }
+}
+
+fn aws_zone(args: &InitArgs, aws_region: &str) -> String {
+    match (args.preset, args.zones.first()) {
+        (InitPreset::AwsSpot, Some(zone)) => zone.clone(),
+        _ => format!("{aws_region}a"),
+    }
+}
+
 fn write_pools(out: &mut String, args: &InitArgs) -> Result<()> {
+    write_pool(out, args, PoolArch::X64)?;
+    if args.arm64 && args.preset != InitPreset::BareMetal {
+        write_pool(out, args, PoolArch::Arm64)?;
+    }
+    Ok(())
+}
+
+fn write_pool(out: &mut String, args: &InitArgs, arch: PoolArch) -> Result<()> {
     let creates = args.max_instances.clamp(1, 4);
-    let disk_gb = match args.preset {
-        InitPreset::BareMetal | InitPreset::Hybrid => 64,
+    let disk_gb = match (args.preset, arch) {
+        (InitPreset::BareMetal | InitPreset::Hybrid, PoolArch::X64) => 64,
         _ => 40,
     };
-    let gcp_region = args.region.as_deref().unwrap_or("us-central1");
-    let gcp_zone = args
-        .zone
-        .as_deref()
-        .map_or_else(|| format!("{gcp_region}-a"), str::to_owned);
-    let aws_region = args.region.as_deref().unwrap_or("us-east-1");
-    let aws_zone = args
-        .zone
-        .as_deref()
-        .map_or_else(|| format!("{aws_region}a"), str::to_owned);
+    let pool = format!("linux-{}", arch.name());
 
-    writeln!(out, "[pools.linux-x64]")?;
-    writeln!(out, "runner_label = \"open-ci-linux-x64\"")?;
-    writeln!(out, "fallback_label = \"ubuntu-24.04\"")?;
-    writeln!(out, "architecture = \"x64\"")?;
+    writeln!(out, "[pools.{pool}]")?;
+    writeln!(out, "runner_label = \"open-ci-{pool}\"")?;
+    writeln!(out, "fallback_label = \"{}\"", arch.fallback_label())?;
+    writeln!(out, "architecture = \"{}\"", arch.name())?;
     writeln!(out, "vcpu = 4")?;
     writeln!(out, "disk_gb = {disk_gb}")?;
     writeln!(out, "max_instances = {}", args.max_instances)?;
@@ -464,8 +565,8 @@ fn write_pools(out: &mut String, args: &InitArgs) -> Result<()> {
     writeln!(out, "transparent_cache = {}", args.with_cache)?;
     writeln!(out)?;
 
-    if matches!(args.preset, InitPreset::BareMetal | InitPreset::Hybrid) {
-        writeln!(out, "[[pools.linux-x64.placements]]")?;
+    if arch == PoolArch::X64 && matches!(args.preset, InitPreset::BareMetal | InitPreset::Hybrid) {
+        writeln!(out, "[[pools.{pool}.placements]]")?;
         writeln!(out, "provider = \"cloud_hypervisor\"")?;
         writeln!(out, "region = \"local\"")?;
         writeln!(out, "zone = \"local-a\"")?;
@@ -478,105 +579,44 @@ fn write_pools(out: &mut String, args: &InitArgs) -> Result<()> {
         args.preset,
         InitPreset::GcpSpot | InitPreset::MultiCloud | InitPreset::Hybrid
     ) {
-        writeln!(out, "[[pools.linux-x64.placements]]")?;
-        writeln!(out, "provider = \"gcp\"")?;
-        writeln!(out, "region = \"{gcp_region}\"")?;
-        writeln!(out, "zone = \"{gcp_zone}\"")?;
-        writeln!(out, "machine_type = \"c4d-standard-4-lssd\"")?;
-        writeln!(
-            out,
-            "subnet = \"projects/{}/regions/{gcp_region}/subnetworks/open-ci\"",
-            args.gcp_project
-        )?;
-        writeln!(out, "disk_type = \"hyperdisk-balanced\"")?;
-        writeln!(out, "disk_interface = \"NVME\"")?;
-        writeln!(out, "nic_type = \"GVNIC\"")?;
-        writeln!(out, "local_ssd_count = 1")?;
-        writeln!(out, "network_bandwidth_tier = \"TIER_1\"")?;
-        writeln!(out, "spot = true")?;
-        writeln!(out)?;
+        let region = gcp_region(args);
+        for zone in gcp_zones(args) {
+            writeln!(out, "[[pools.{pool}.placements]]")?;
+            writeln!(out, "provider = \"gcp\"")?;
+            writeln!(out, "region = \"{region}\"")?;
+            writeln!(out, "zone = \"{zone}\"")?;
+            writeln!(out, "machine_type = \"{}\"", arch.gcp_machine_type())?;
+            writeln!(
+                out,
+                "subnet = \"projects/{}/regions/{region}/subnetworks/open-ci-runners-{region}\"",
+                args.gcp_project
+            )?;
+            writeln!(
+                out,
+                "image = \"{}\"",
+                gcp_image_path(&args.gcp_project, arch)
+            )?;
+            writeln!(out, "disk_type = \"hyperdisk-balanced\"")?;
+            writeln!(out, "disk_interface = \"NVME\"")?;
+            writeln!(out, "nic_type = \"GVNIC\"")?;
+            writeln!(out, "local_ssd_count = 1")?;
+            writeln!(out, "network_bandwidth_tier = \"TIER_1\"")?;
+            if let Some(tpc) = arch.gcp_threads_per_core() {
+                writeln!(out, "threads_per_core = {tpc}")?;
+            }
+            writeln!(out, "spot = true")?;
+            writeln!(out)?;
+        }
     }
     if matches!(args.preset, InitPreset::AwsSpot | InitPreset::MultiCloud) {
-        writeln!(out, "[[pools.linux-x64.placements]]")?;
+        let aws_region = args.region.as_deref().unwrap_or("us-east-1");
+        writeln!(out, "[[pools.{pool}.placements]]")?;
         writeln!(out, "provider = \"aws\"")?;
         writeln!(out, "region = \"{aws_region}\"")?;
-        writeln!(out, "zone = \"{aws_zone}\"")?;
-        writeln!(out, "machine_type = \"c7ad.xlarge\"")?;
+        writeln!(out, "zone = \"{}\"", aws_zone(args, aws_region))?;
+        writeln!(out, "machine_type = \"{}\"", arch.aws_machine_type())?;
         writeln!(out, "subnet = \"subnet-0123456789abcdef0\"")?;
-        writeln!(out, "image = \"ami-0123456789abcdef0\"")?;
-        writeln!(out, "security_group = \"sg-0123456789abcdef0\"")?;
-        writeln!(out, "root_device = \"/dev/sda1\"")?;
-        writeln!(out, "spot = true")?;
-        writeln!(out)?;
-    }
-
-    if args.arm64 && args.preset != InitPreset::BareMetal {
-        write_arm64_pool(out, args, creates)?;
-    }
-    Ok(())
-}
-
-fn write_arm64_pool(out: &mut String, args: &InitArgs, creates: usize) -> Result<()> {
-    let gcp_region = args.region.as_deref().unwrap_or("us-central1");
-    let gcp_zone = args
-        .zone
-        .as_deref()
-        .map_or_else(|| format!("{gcp_region}-a"), str::to_owned);
-    let aws_region = args.region.as_deref().unwrap_or("us-east-1");
-    let aws_zone = args
-        .zone
-        .as_deref()
-        .map_or_else(|| format!("{aws_region}a"), str::to_owned);
-    writeln!(out, "[pools.linux-arm64]")?;
-    writeln!(out, "runner_label = \"open-ci-linux-arm64\"")?;
-    writeln!(out, "fallback_label = \"ubuntu-24.04-arm\"")?;
-    writeln!(out, "architecture = \"arm64\"")?;
-    writeln!(out, "vcpu = 4")?;
-    writeln!(out, "disk_gb = 40")?;
-    writeln!(out, "max_instances = {}", args.max_instances)?;
-    writeln!(out, "min_idle_instances = {}", args.min_idle)?;
-    writeln!(out, "creates_per_tick = {creates}")?;
-    writeln!(out, "lifetime_seconds = 2400")?;
-    writeln!(out, "idle_seconds = 180")?;
-    writeln!(out, "prefer_cheapest = true")?;
-    writeln!(out, "transparent_cache = {}", args.with_cache)?;
-    writeln!(out)?;
-
-    if matches!(
-        args.preset,
-        InitPreset::GcpSpot | InitPreset::MultiCloud | InitPreset::Hybrid
-    ) {
-        writeln!(out, "[[pools.linux-arm64.placements]]")?;
-        writeln!(out, "provider = \"gcp\"")?;
-        writeln!(out, "region = \"{gcp_region}\"")?;
-        writeln!(out, "zone = \"{gcp_zone}\"")?;
-        writeln!(out, "machine_type = \"c4a-standard-4-lssd\"")?;
-        writeln!(
-            out,
-            "subnet = \"projects/{}/regions/{gcp_region}/subnetworks/open-ci\"",
-            args.gcp_project
-        )?;
-        writeln!(
-            out,
-            "image = \"projects/{}/global/images/open-ci-ubuntu-2404-arm64-v1\"",
-            args.gcp_project
-        )?;
-        writeln!(out, "disk_type = \"hyperdisk-balanced\"")?;
-        writeln!(out, "disk_interface = \"NVME\"")?;
-        writeln!(out, "nic_type = \"GVNIC\"")?;
-        writeln!(out, "local_ssd_count = 1")?;
-        writeln!(out, "network_bandwidth_tier = \"TIER_1\"")?;
-        writeln!(out, "spot = true")?;
-        writeln!(out)?;
-    }
-    if matches!(args.preset, InitPreset::AwsSpot | InitPreset::MultiCloud) {
-        writeln!(out, "[[pools.linux-arm64.placements]]")?;
-        writeln!(out, "provider = \"aws\"")?;
-        writeln!(out, "region = \"{aws_region}\"")?;
-        writeln!(out, "zone = \"{aws_zone}\"")?;
-        writeln!(out, "machine_type = \"c8gd.xlarge\"")?;
-        writeln!(out, "subnet = \"subnet-0123456789abcdef0\"")?;
-        writeln!(out, "image = \"ami-0fedcba9876543210\"")?;
+        writeln!(out, "image = \"{}\"", arch.aws_image())?;
         writeln!(out, "security_group = \"sg-0123456789abcdef0\"")?;
         writeln!(out, "root_device = \"/dev/sda1\"")?;
         writeln!(out, "spot = true")?;
@@ -598,7 +638,7 @@ mod tests {
             gcp_project: "acme-ci-prod".to_owned(),
             aws_account: "123456789012".to_owned(),
             region: None,
-            zone: None,
+            zones: Vec::new(),
             arm64: false,
             with_cache: false,
             cache_url: None,
@@ -645,6 +685,152 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    fn gcp_placements<'a>(
+        cfg: &'a OpenCiConfig,
+        pool: &str,
+    ) -> Vec<&'a open_ci_core::config::Placement> {
+        cfg.pools.get(pool).map_or_else(Vec::new, |p| {
+            p.placements
+                .iter()
+                .filter(|pl| pl.provider == open_ci_core::models::ProviderKind::Gcp)
+                .collect()
+        })
+    }
+
+    #[test]
+    fn gcp_presets_default_to_direct_egress_multi_zone_failover_and_pinned_images() {
+        for preset in [
+            InitPreset::GcpSpot,
+            InitPreset::MultiCloud,
+            InitPreset::Hybrid,
+        ] {
+            let mut args = base_args(preset);
+            args.arm64 = true;
+            let parsed = render_init_config(&args)
+                .map_err(|e| e.to_string())
+                .and_then(|t| OpenCiConfig::parse_toml(&t).map_err(|e| e.to_string()));
+            assert!(parsed.is_ok(), "{preset:?}: {parsed:?}");
+            let Ok(cfg) = parsed else { return };
+            let gcp = cfg.gcp.as_ref();
+            assert!(gcp.is_some_and(|g| g.external_ipv4), "{preset:?}");
+            assert!(gcp.is_some_and(|g| g.network_tags == ["open-ci-runner"]));
+            assert!(gcp.is_some_and(|g| g.image.ends_with(&runner_image_name("x64"))));
+
+            for (pool, machine, tpc, arch) in [
+                ("linux-x64", "c4d-standard-8-lssd", Some(1), "x64"),
+                ("linux-arm64", "c4a-standard-4-lssd", None, "arm64"),
+            ] {
+                let placements = gcp_placements(&cfg, pool);
+                let zones: Vec<&str> = placements.iter().map(|p| p.zone.as_str()).collect();
+                assert_eq!(
+                    zones,
+                    ["us-central1-a", "us-central1-b", "us-central1-c"],
+                    "{preset:?} {pool}"
+                );
+                for placement in placements {
+                    assert_eq!(placement.machine_type, machine);
+                    assert_eq!(placement.threads_per_core, tpc);
+                    assert_eq!(placement.local_ssd_count, Some(1));
+                    assert!(placement.spot);
+                    assert_eq!(
+                        placement.subnet,
+                        "projects/acme-ci-prod/regions/us-central1/subnetworks/open-ci-runners-us-central1"
+                    );
+                    assert!(
+                        placement
+                            .image
+                            .as_deref()
+                            .is_some_and(|i| i.ends_with(&runner_image_name(arch)))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zone_override_sets_gcp_failover_order_and_aws_spot_primary_zone() {
+        let mut gcp = base_args(InitPreset::GcpSpot);
+        gcp.region = Some("us-east1".to_owned());
+        gcp.zones = vec!["us-east1-b".to_owned(), "us-east1-d".to_owned()];
+        let cfg = render_init_config(&gcp)
+            .ok()
+            .and_then(|t| OpenCiConfig::parse_toml(&t).ok());
+        let zones: Vec<String> = cfg.as_ref().map_or_else(Vec::new, |c| {
+            gcp_placements(c, "linux-x64")
+                .iter()
+                .map(|p| p.zone.clone())
+                .collect()
+        });
+        assert_eq!(zones, ["us-east1-b", "us-east1-d"]);
+
+        let mut aws = base_args(InitPreset::AwsSpot);
+        aws.zones = vec!["us-east-1c".to_owned()];
+        let cfg = render_init_config(&aws)
+            .ok()
+            .and_then(|t| OpenCiConfig::parse_toml(&t).ok());
+        let aws_zone = cfg
+            .as_ref()
+            .and_then(|c| c.pools.get("linux-x64"))
+            .and_then(|p| p.placements.first())
+            .map(|p| p.zone.clone());
+        assert_eq!(aws_zone.as_deref(), Some("us-east-1c"));
+    }
+
+    fn packer_variable_default(hcl: &str, name: &str) -> Option<String> {
+        let block = hcl.split(&format!("variable \"{name}\"")).nth(1)?;
+        let line = block
+            .lines()
+            .find(|l| l.trim_start().starts_with("default"))?;
+        Some(line.split('"').nth(1)?.to_owned())
+    }
+
+    #[test]
+    fn pinned_runner_image_matches_packer_defaults_and_example_configs() {
+        let hcl = include_str!("../../../../infra/packer/ubuntu-runner.pkr.hcl");
+        assert_eq!(
+            packer_variable_default(hcl, "open_ci_version").as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "bump open_ci_version in infra/packer/ubuntu-runner.pkr.hcl to the workspace version"
+        );
+        assert_eq!(
+            packer_variable_default(hcl, "github_runner_version").as_deref(),
+            Some(GITHUB_RUNNER_VERSION),
+            "keep GITHUB_RUNNER_VERSION in sync with github_runner_version in ubuntu-runner.pkr.hcl"
+        );
+
+        for (path, text) in [
+            (
+                "config/open-ci.example.toml",
+                include_str!("../../../../config/open-ci.example.toml"),
+            ),
+            (
+                "config/open-ci.high-perf.example.toml",
+                include_str!("../../../../config/open-ci.high-perf.example.toml"),
+            ),
+            (
+                "config/open-ci.hybrid-byoc.example.toml",
+                include_str!("../../../../config/open-ci.hybrid-byoc.example.toml"),
+            ),
+        ] {
+            for line in text.lines().filter(|l| l.contains("/global/images/")) {
+                let pinned = ["x64", "arm64"]
+                    .iter()
+                    .any(|arch| line.ends_with(&format!("/{}\"", runner_image_name(arch))));
+                assert!(
+                    pinned,
+                    "{path}: GCP image must be pinned to {}: {line}",
+                    runner_image_name("<arch>")
+                );
+            }
+            let cfg = OpenCiConfig::parse_toml(text);
+            assert!(
+                cfg.as_ref()
+                    .is_ok_and(|c| c.gcp.as_ref().is_none_or(|g| g.external_ipv4)),
+                "{path}: GCP examples must default to external_ipv4 = true direct egress"
+            );
         }
     }
 

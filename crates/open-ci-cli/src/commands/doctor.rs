@@ -328,7 +328,7 @@ mod tests {
             gcp_project: "acme-ci".to_owned(),
             aws_account: "123456789012".to_owned(),
             region: None,
-            zone: None,
+            zones: Vec::new(),
             arm64: false,
             with_cache: true,
             cache_url: None,
