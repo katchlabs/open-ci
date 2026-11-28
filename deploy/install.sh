@@ -259,3 +259,7 @@ echo "  1. Install your GitHub App private key at /etc/open-ci/github-app.pem (0
 echo "  2. Fill in cloud subnet/image placeholders in /etc/open-ci/open-ci.toml"
 echo "  3. Verify readiness: sudo -u open-ci bash -c 'set -a; source /etc/open-ci/open-ci.env; open-ci doctor --config /etc/open-ci/open-ci.toml${CACHE_FLAG}'"
 echo "  4. Start:            sudo systemctl enable --now open-ci.service"
+if [[ "${WITH_CACHE}" == "true" ]]; then
+  echo "  Cache on local NVMe: format it journal-less (mkfs.ext4 -F -O ^has_journal -m 0) and mount -o noatime (no discard)"
+  echo "                      at /var/lib/open-ci-cache before step 4 with infra/scripts/setup-cache-nvme.sh --device <disk> --install-unit (docs/cache.md)"
+fi

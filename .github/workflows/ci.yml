@@ -102,7 +102,7 @@ jobs:
             terraform -chdir="${dir}" validate
             echo "::endgroup::"
           done
-      - name: ShellCheck runner provisioning scripts
+      - name: ShellCheck runner and cache disk provisioning scripts
         run: |
-          bash -n infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh
-          shellcheck infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh
+          bash -n infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/scripts/setup-cache-nvme.sh
+          shellcheck infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/scripts/setup-cache-nvme.sh
