@@ -490,8 +490,8 @@ impl PoolArch {
 /// Project hosting the pre-baked runner images, readable by `allAuthenticatedUsers`.
 pub const PUBLIC_GCP_IMAGE_PROJECT: &str = "open-ci-public-images";
 
-/// Image tag pinned to `open-ci` v0.2.1 and `actions/runner` v2.338.2.
-const PUBLIC_GCP_IMAGE_TAG: &str = "v021-r2";
+/// Image tag pinned to `open-ci` v0.2.2 and `actions/runner` v2.338.2.
+const PUBLIC_GCP_IMAGE_TAG: &str = "v022-r1";
 
 fn public_gcp_image(arch: PoolArch) -> String {
     format!(

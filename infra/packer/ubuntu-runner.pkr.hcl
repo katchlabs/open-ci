@@ -31,7 +31,7 @@ variable "github_runner_version" {
 
 variable "open_ci_version" {
   type        = string
-  default     = "0.2.1"
+  default     = "0.2.2"
   description = "open-ci release baked into the image; pins the GCP image name referenced by `open-ci init`."
 }
 
