@@ -61,6 +61,12 @@ if ALLOW_HITS="$(grep -rn '#\[allow(' crates/ || true)" && [[ -n "$ALLOW_HITS" ]
 fi
 echo "  ok: zero #[allow( attributes in crates/"
 
+if FSYNC_HITS="$(grep -rnE '\.sync_(all|data)\(' crates/open-ci-cache/src || true)" && [[ -n "$FSYNC_HITS" ]]; then
+  printf '%s\n' "$FSYNC_HITS" >&2
+  fail "open-ci-cache must not fsync: on ext4 data=ordered one fsync flushes every concurrent upload's dirty pages and stalls all saves. Publish with write + flush + atomic rename, and let a torn file read as a cache miss."
+fi
+echo "  ok: zero fsync calls in open-ci-cache (no ext4 journal-commit stampede)"
+
 CORE_TREE="$(cargo tree -p open-ci-core -e normal)"
 if FORBIDDEN_DEPS="$(printf '%s\n' "$CORE_TREE" | grep -E '(^|[[:space:]])(tokio|reqwest|rusqlite|axum|hyper)[[:space:]]' || true)" && [[ -n "$FORBIDDEN_DEPS" ]]; then
   printf '%s\n' "$FORBIDDEN_DEPS" >&2
@@ -124,11 +130,11 @@ else
   echo "  warn: terraform not installed; skipping terraform fmt -check"
 fi
 
-bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh
+bash -n scripts/verify.sh scripts/cache-client-e2e.sh .agents/skills/verify-open-ci/scripts/drive.sh deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh infra/scripts/setup-cache-nvme.sh
 echo "  ok: bash -n passed for verify.sh, drive.sh, deploy/install.sh, Packer, Cloud Hypervisor, and BYOC scripts"
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh
+  shellcheck deploy/install.sh infra/packer/scripts/install-runner.sh infra/packer/scripts/setup-nvme.sh infra/cloud-hypervisor/setup-host.sh infra/cloud-hypervisor/build-rootfs.sh infra/scripts/connect-gcp-byoc.sh infra/scripts/setup-cache-nvme.sh
   echo "  ok: shellcheck passed for deploy/install.sh, Packer, Cloud Hypervisor, and BYOC scripts"
 else
   echo "  warn: shellcheck not installed; skipping shellcheck"

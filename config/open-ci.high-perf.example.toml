@@ -35,7 +35,8 @@ max_entry_bytes = 10737418240
 signed_url_ttl_seconds = 900
 # Optional in-memory hot tier in front of [cache.storage] (4 GiB here; size to <= 50% of host RAM).
 hot_cache_bytes = 4294967296
-# Matches deploy/systemd/open-ci-cache.service ReadWritePaths. Mount local NVMe at /var/lib/open-ci-cache for fastest I/O.
+# Matches deploy/systemd/open-ci-cache.service ReadWritePaths. Mount local NVMe at /var/lib/open-ci-cache for fastest I/O
+# (journal-less ext4, noatime, no discard: infra/scripts/setup-cache-nvme.sh, docs/cache.md).
 index_path = "/var/lib/open-ci-cache/index.db"
 upstream_results_url = "https://results-receiver.actions.githubusercontent.com"
 

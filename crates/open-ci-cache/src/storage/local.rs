@@ -405,14 +405,17 @@ async fn write_stream(path: &Path, mut body: ByteStream) -> Result<(), CacheErro
         .map_err(|err| storage_error("flushing blob", &err))
 }
 
+/// Writes a small file for atomic `rename` publication without `fsync`: on ext4 `data=ordered`
+/// one fsync commits the whole journal transaction, stalling every concurrent upload until all
+/// of their dirty pages reach disk. A manifest torn by power loss parses as a cache miss.
 async fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
     let mut file = create_private_file(path).await?;
     file.write_all(bytes)
         .await
         .map_err(|err| storage_error("writing manifest", &err))?;
-    file.sync_all()
+    file.flush()
         .await
-        .map_err(|err| storage_error("syncing manifest", &err))
+        .map_err(|err| storage_error("flushing manifest", &err))
 }
 
 async fn prune_unreferenced_files(dir: &Path, keep: &HashSet<&str>) -> Result<(), CacheError> {

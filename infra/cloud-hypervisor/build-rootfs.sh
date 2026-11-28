@@ -212,6 +212,7 @@ mount --bind /dev "${MNT}/dev"
 mount --bind /dev/pts "${MNT}/dev/pts"
 
 log "installing guest base packages, toolchain, and kernel (${KERNEL_PACKAGE})"
+# shellcheck disable=SC2016 # expands inside the guest chroot, not on the host
 chroot "${MNT}" /usr/bin/env \
   DEBIAN_FRONTEND=noninteractive \
   KERNEL_PACKAGE="${KERNEL_PACKAGE}" \
@@ -452,6 +453,7 @@ StandardError=journal+console
 WantedBy=multi-user.target
 EOF
 
+# shellcheck disable=SC2016 # expands inside the guest chroot, not on the host
 chroot "${MNT}" /usr/bin/env \
   DEBIAN_FRONTEND=noninteractive \
   RUNNER_ARCH="${RUNNER_ARCH}" \

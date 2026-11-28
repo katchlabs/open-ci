@@ -21,5 +21,7 @@ pub use ids::{BlobId, BlockId, ByteRange};
 pub use index::{
     CacheEntry, CacheIndex, EntryKey, Reservation, RestoreQuery, RetentionPolicy, Swept,
 };
-pub use storage::{BlobStore, BlobUpload, ByteStream, HotMemoryBlobStore, LocalBlobStore};
+pub use storage::{
+    BlobStore, BlobUpload, ByteStream, HotMemoryBlobStore, HotMemoryUsage, LocalBlobStore,
+};
 pub use storage::{GcsBlobStore, GcsStoreConfig, S3BlobStore, S3StoreConfig};
