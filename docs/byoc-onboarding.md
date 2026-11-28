@@ -24,6 +24,8 @@ Your GCP project grants short-lived keyless **Service Account Impersonation** (`
 
 Add `--enable-cache-bucket` to also provision a private regional GCS bucket for direct BYOC Actions caching, or pass `--existing-network` and `--existing-subnet` to reuse an existing VPC. The script prints a JSON connection bundle ready to paste into your control plane.
 
+The provisioner role includes `compute.subnetworks.useExternalIp`, so runners with `external_ipv4 = true` (the `open-ci init` GCP default) egress directly instead of through Cloud NAT, while the `open-ci-deny-runner-ingress` firewall on tag `open-ci-runner` keeps every inbound port closed. Re-running the script updates an existing role in place.
+
 ### Option B: Terraform (`infra/terraform/modules/gcp-byoc`)
 
 ```hcl

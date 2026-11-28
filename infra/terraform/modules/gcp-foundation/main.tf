@@ -89,6 +89,7 @@ resource "google_project_iam_custom_role" "runner_controller" {
     "compute.instances.setMetadata",
     "compute.instances.setTags",
     "compute.subnetworks.use",
+    "compute.subnetworks.useExternalIp",
     "compute.zoneOperations.get",
     "compute.zones.get",
   ]

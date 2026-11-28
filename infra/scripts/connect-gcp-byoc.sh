@@ -131,7 +131,7 @@ NAT_NAME="${NAME_PREFIX}-nat-${REGION}"
 FW_NAME="${NAME_PREFIX}-deny-runner-ingress"
 CACHE_BUCKET="${PROJECT_ID}-${NAME_PREFIX}-cache-${REGION}"
 
-PROVISIONER_PERMS="compute.disks.create,compute.disks.get,compute.disks.list,compute.disks.setLabels,compute.disks.use,compute.images.get,compute.images.getFromFamily,compute.images.useReadOnly,compute.instances.create,compute.instances.get,compute.instances.list,compute.instances.setLabels,compute.instances.setMetadata,compute.instances.setTags,compute.networks.list,compute.regions.get,compute.subnetworks.list,compute.subnetworks.use,compute.zoneOperations.get,compute.zones.get"
+PROVISIONER_PERMS="compute.disks.create,compute.disks.get,compute.disks.list,compute.disks.setLabels,compute.disks.use,compute.images.get,compute.images.getFromFamily,compute.images.useReadOnly,compute.instances.create,compute.instances.get,compute.instances.list,compute.instances.setLabels,compute.instances.setMetadata,compute.instances.setTags,compute.networks.list,compute.regions.get,compute.subnetworks.list,compute.subnetworks.use,compute.subnetworks.useExternalIp,compute.zoneOperations.get,compute.zones.get"
 CLEANER_PERMS="compute.disks.delete,compute.instances.delete"
 CLEANER_CONDITION="expression=resource.name.extract('/instances/{name}').startsWith('open-ci-') || resource.name.extract('/disks/{name}').startsWith('open-ci-'),title=OnlyOpenCiPrefixedResources,description=Restrict VM and disk deletion to open-ci-* ephemeral runners."
 

@@ -51,6 +51,7 @@ resource "google_project_iam_custom_role" "runner_provisioner" {
     "compute.regions.get",
     "compute.subnetworks.list",
     "compute.subnetworks.use",
+    "compute.subnetworks.useExternalIp",
     "compute.zoneOperations.get",
     "compute.zones.get",
   ]

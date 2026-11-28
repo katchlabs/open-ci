@@ -155,7 +155,12 @@ fi
 if grep -Eq '"iam\.serviceAccounts\.actAs"|iam\.serviceAccounts\.actAs,' infra/terraform/modules/gcp-byoc/main.tf infra/scripts/connect-gcp-byoc.sh; then
   fail "Policy check failed: GCP BYOC templates must never grant iam.serviceAccounts.actAs (runners must stay zero-IAM)."
 fi
-echo "  ok: policy check BYOC IaC (zero iam:PassRole, zero actAs, IMDSv2 required)"
+for gcp_role_file in infra/terraform/modules/gcp-byoc/main.tf infra/terraform/modules/gcp-foundation/main.tf infra/scripts/connect-gcp-byoc.sh; do
+  if ! grep -Eq '"compute\.subnetworks\.useExternalIp"|compute\.subnetworks\.useExternalIp,' "$gcp_role_file"; then
+    fail "Policy check failed: grant compute.subnetworks.useExternalIp in ${gcp_role_file} so external_ipv4 = true runners egress directly (no Cloud NAT fees/caps) behind the zero-ingress runner tag."
+  fi
+done
+echo "  ok: policy check BYOC IaC (zero iam:PassRole, zero actAs, IMDSv2 required, GCP useExternalIp granted)"
 
 if ! grep -Fq '"MetadataOptions.HttpTokens"' crates/open-ci-provider-aws/src/params.rs \
   || ! grep -Eq '"MetadataOptions\.HttpTokens",[[:space:]]*"required"' crates/open-ci-provider-aws/src/params.rs; then
