@@ -17,7 +17,7 @@ use std::io;
 
 pub use gcs::{GcsBlobStore, GcsStoreConfig};
 pub use local::LocalBlobStore;
-pub use memory::HotMemoryBlobStore;
+pub use memory::{HotMemoryBlobStore, HotMemoryUsage};
 pub use s3::{S3BlobStore, S3StoreConfig};
 
 /// Fallible stream of body bytes moving between HTTP and a backend without full buffering.
@@ -80,13 +80,13 @@ fn exact_length(body: ByteStream, expected: u64) -> ByteStream {
             Some(Err(err)) => Err(err),
             Some(Ok(chunk)) => {
                 let seen = seen.saturating_add(chunk.len() as u64);
-                let overran =
-                    seen > expected || (seen == expected && !source_finished(&mut body).await);
-                if overran {
-                    Err(length_mismatch(expected))
-                } else {
+                if seen < expected {
                     return Some((Ok(chunk), Some((body, seen))));
                 }
+                if seen == expected && source_finished(&mut body).await {
+                    return Some((Ok(chunk), None));
+                }
+                Err(length_mismatch(expected))
             }
         };
         Some((item, None))
