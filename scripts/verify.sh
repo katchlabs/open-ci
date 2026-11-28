@@ -160,7 +160,15 @@ for gcp_role_file in infra/terraform/modules/gcp-byoc/main.tf infra/terraform/mo
     fail "Policy check failed: grant compute.subnetworks.useExternalIp in ${gcp_role_file} so external_ipv4 = true runners egress directly (no Cloud NAT fees/caps) behind the zero-ingress runner tag."
   fi
 done
-echo "  ok: policy check BYOC IaC (zero iam:PassRole, zero actAs, IMDSv2 required, GCP useExternalIp granted)"
+for gcp_fw_file in infra/terraform/modules/gcp-byoc/main.tf infra/terraform/modules/gcp-foundation/main.tf; do
+  if ! awk '/resource "google_compute_firewall" "deny_runner_ingress"/{r=1} r&&/^}/{r=0} r&&/priority[[:space:]]*=[[:space:]]*100$/{found=1} END{exit !found}' "$gcp_fw_file"; then
+    fail "Policy check failed: set priority = 100 on deny_runner_ingress in ${gcp_fw_file} so allow rules in reused VPCs never expose external_ipv4 runners."
+  fi
+done
+if ! grep -Eq '^FW_PRIORITY=100$' infra/scripts/connect-gcp-byoc.sh; then
+  fail "Policy check failed: keep FW_PRIORITY=100 in infra/scripts/connect-gcp-byoc.sh so allow rules in reused VPCs never expose external_ipv4 runners."
+fi
+echo "  ok: policy check BYOC IaC (zero iam:PassRole, zero actAs, IMDSv2 required, GCP useExternalIp granted, deny-ingress priority 100)"
 
 if ! grep -Fq '"MetadataOptions.HttpTokens"' crates/open-ci-provider-aws/src/params.rs \
   || ! grep -Eq '"MetadataOptions\.HttpTokens",[[:space:]]*"required"' crates/open-ci-provider-aws/src/params.rs; then

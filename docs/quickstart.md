@@ -61,7 +61,7 @@ terraform apply \
   -var="domain=ci.example.com"
 ```
 
-The runner subnet (`open-ci-runners-<region>`), `open-ci-runner` deny-all-ingress firewall tag, and runner role (including `compute.subnetworks.useExternalIp`) match the `open-ci init` GCP presets, so runners egress directly over ephemeral external IPv4 without Cloud NAT data-processing fees or bandwidth caps while exposing zero inbound ports. Presets place each pool in `us-central1-a` → `us-central1-b` → `us-central1-c`; a Spot stockout backs off only the affected zone. For regions without an `-a` zone, pass `open-ci init --zone us-east1-b,us-east1-c,us-east1-d`.
+The runner subnet (`open-ci-runners-<region>`), `open-ci-runner` deny-all-ingress firewall tag (priority `100`), and runner role (including `compute.subnetworks.useExternalIp`) match the `open-ci init` GCP presets, so runners egress directly over ephemeral external IPv4 without Cloud NAT data-processing fees or bandwidth caps while exposing zero inbound ports. Presets place each pool in `us-central1-a` → `us-central1-b` → `us-central1-c`; a Spot stockout backs off only the affected zone. For regions without an `-a` zone, pass `open-ci init --zone us-east1-b,us-east1-c,us-east1-d`.
 
 ### Path C: Multi-Cloud (`multi-cloud`)
 

@@ -137,7 +137,7 @@ resource "google_compute_firewall" "deny_runner_ingress" {
   name        = "${var.name_prefix}-deny-runner-ingress"
   network     = local.network_name
   direction   = "INGRESS"
-  priority    = 65534
+  priority    = 100
   target_tags = [local.runner_network_tag]
 
   deny {

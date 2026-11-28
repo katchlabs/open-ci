@@ -110,9 +110,11 @@ fi
 
 run_cmd() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '[dry-run]'
-    printf ' %q' "$@"
-    printf '\n'
+    {
+      printf '[dry-run]'
+      printf ' %q' "$@"
+      printf '\n'
+    } >&2
   else
     "$@"
   fi
@@ -129,6 +131,7 @@ SUBNET_NAME="${NAME_PREFIX}-runners-${REGION}"
 ROUTER_NAME="${NAME_PREFIX}-nat-router-${REGION}"
 NAT_NAME="${NAME_PREFIX}-nat-${REGION}"
 FW_NAME="${NAME_PREFIX}-deny-runner-ingress"
+FW_PRIORITY=100
 CACHE_BUCKET="${PROJECT_ID}-${NAME_PREFIX}-cache-${REGION}"
 
 PROVISIONER_PERMS="compute.disks.create,compute.disks.get,compute.disks.list,compute.disks.setLabels,compute.disks.use,compute.images.get,compute.images.getFromFamily,compute.images.useReadOnly,compute.instances.create,compute.instances.get,compute.instances.list,compute.instances.setLabels,compute.instances.setMetadata,compute.instances.setTags,compute.networks.list,compute.regions.get,compute.subnetworks.list,compute.subnetworks.use,compute.subnetworks.useExternalIp,compute.zoneOperations.get,compute.zones.get"
@@ -242,15 +245,22 @@ else
   fi
 fi
 
-printf '==> Ensuring deny-all-ingress firewall rule for runner tag (%s)\n' "$RUNNER_TAG"
+printf '==> Ensuring deny-all-ingress firewall rule for runner tag (%s) at priority %s\n' "$RUNNER_TAG" "$FW_PRIORITY"
 if [[ "$DRY_RUN" -eq 1 ]] || ! gcloud compute firewall-rules describe "$FW_NAME" --project="$PROJECT_ID" >/dev/null 2>&1; then
   run_cmd gcloud compute firewall-rules create "$FW_NAME" \
     --project="$PROJECT_ID" \
     --network="$FINAL_NETWORK" \
     --direction=INGRESS \
-    --priority=65534 \
+    --priority="$FW_PRIORITY" \
     --action=DENY \
     --rules=all \
+    --source-ranges=0.0.0.0/0 \
+    --target-tags="$RUNNER_TAG" \
+    --quiet >/dev/null
+else
+  run_cmd gcloud compute firewall-rules update "$FW_NAME" \
+    --project="$PROJECT_ID" \
+    --priority="$FW_PRIORITY" \
     --source-ranges=0.0.0.0/0 \
     --target-tags="$RUNNER_TAG" \
     --quiet >/dev/null
