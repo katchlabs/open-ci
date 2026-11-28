@@ -19,7 +19,7 @@ variable "arch" {
   description = "Target CPU architecture: x64 or arm64."
   validation {
     condition     = contains(["x64", "arm64"], var.arch)
-    error_message = "arch must be x64 or arm64."
+    error_message = "The arch variable must be x64 or arm64."
   }
 }
 
