@@ -24,7 +24,7 @@ All operator routes require `Authorization: Bearer <operator-token>` (unauthenti
 | `GET /api/v1/workers` | Lists active and historical workers with lifecycle phase and placement metadata. |
 | `GET /api/v1/jobs` | Lists observed GitHub `workflow_job` records and routing state. |
 | `GET /api/v1/admissions` | Lists active and historical run admissions. |
-| `GET /api/v1/backoffs` | Lists active regional quota/capacity backoffs. |
+| `GET /api/v1/backoffs` | Lists active regional quota/rate-limit and zonal stockout backoffs. |
 | `GET /api/v1/audit` | Lists operator mutation audit log entries. |
 | `POST /api/v1/control/mode` | Persists control mode transitions (`active`, `fallback-only`, `draining`, `paused`) and writes an audit record. |
 | `POST /api/v1/reconcile` | Triggers an immediate non-blocking reconciliation pass. |

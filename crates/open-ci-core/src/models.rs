@@ -1,5 +1,6 @@
 //! Vendor-neutral domain models for `open-ci`.
 
+use crate::config::Placement;
 use crate::error::DomainError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -419,14 +420,45 @@ pub struct WorkerUsage {
     pub tx_bytes: u64,
 }
 
-/// Regional/family backoff after a cloud quota or stockout rejection.
+/// Machine-family backoff after a cloud quota, stockout, or rate-limit rejection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementBackoff {
     pub provider: ProviderKind,
+    /// Backoff scope: a region (covers every zone in it) or a single zone.
     pub region: String,
     pub family: String,
     pub retry_after: u64,
     pub reason: String,
+}
+
+impl PlacementBackoff {
+    /// Region-wide backoff for regional limits (quota, API rate limits).
+    pub fn regional(placement: &Placement, retry_after: u64, reason: &str) -> Self {
+        Self::scoped(placement, placement.region.clone(), retry_after, reason)
+    }
+
+    /// Zone-scoped backoff for stockouts so sibling zones in the region stay selectable.
+    pub fn zonal(placement: &Placement, retry_after: u64, reason: &str) -> Self {
+        Self::scoped(placement, placement.zone.clone(), retry_after, reason)
+    }
+
+    fn scoped(placement: &Placement, scope: String, retry_after: u64, reason: &str) -> Self {
+        Self {
+            provider: placement.provider,
+            region: scope,
+            family: placement.machine_family().to_owned(),
+            retry_after,
+            reason: reason.to_owned(),
+        }
+    }
+
+    /// Returns `true` while this backoff blocks launches on `placement`.
+    pub fn blocks(&self, placement: &Placement, now_unix: u64) -> bool {
+        self.retry_after > now_unix
+            && self.provider == placement.provider
+            && (self.region == placement.region || self.region == placement.zone)
+            && self.family == placement.machine_family()
+    }
 }
 
 /// Authenticated workflow run requesting self-hosted capacity.
